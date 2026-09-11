@@ -176,6 +176,14 @@ export function createProviderRegistry(config, { host, port }) {
     [...providers.values()].find((provider) => provider.discover)?.name ||
     defaultProvider;
 
+  // Bumped whenever anything that affects which offerings exist changes: a
+  // catalog reload or an API key added/removed. offeringsForSlug rebuilds its
+  // index only when this moves, so a lookup is a Map hit instead of a scan of
+  // every provider's catalog.
+  let offeringsGeneration = 0;
+  let offeringsIndex = null;
+  let offeringsIndexGeneration = -1;
+
   function get(name) {
     return providers.get(name);
   }
@@ -247,35 +255,45 @@ export function createProviderRegistry(config, { host, port }) {
     return { provider: providerName, model };
   }
 
-  function offeringsForSlug(slug) {
-    const normalized = String(slug || '');
-    if (!normalized) return [];
-    const offerings = [];
-    const seen = new Set();
+  // One pass over every provider, grouping the free chat offerings by model
+  // slug. Rebuilt only when offeringsGeneration moves.
+  function buildOfferingsIndex() {
+    const index = new Map();
+    const add = (slug, offering) => {
+      if (!slug) return;
+      let list = index.get(slug);
+      if (!list) index.set(slug, (list = []));
+      const key = `${offering.provider}:${offering.model}`;
+      if (list.some((entry) => `${entry.provider}:${entry.model}` === key)) return;
+      list.push(offering);
+    };
     for (const provider of providers.values()) {
       if (!provider.apiKey) continue;
       if (provider.catalogHasPricing) {
         if (!provider.catalog) continue;
         for (const model of provider.catalog.values()) {
-          if (normalizeModelSlug(model.id) !== normalized) continue;
           if (!isZeroCost(model) || !isChatModel(model)) continue;
-          const key = `${provider.name}:${model.id}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          offerings.push({ provider: provider.name, model: model.id });
+          add(normalizeModelSlug(model.id), { provider: provider.name, model: model.id });
         }
         continue;
       }
       for (const id of provider.freeModels) {
-        if (normalizeModelSlug(id) !== normalized) continue;
         if (provider.usesCatalog && provider.catalog.size && !catalogEntry(provider, id)) continue;
-        const key = `${provider.name}:${id}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        offerings.push({ provider: provider.name, model: id });
+        add(normalizeModelSlug(id), { provider: provider.name, model: id });
       }
     }
-    return offerings;
+    return index;
+  }
+
+  function offeringsForSlug(slug) {
+    const normalized = String(slug || '');
+    if (!normalized) return [];
+    if (offeringsIndexGeneration !== offeringsGeneration || !offeringsIndex) {
+      offeringsIndex = buildOfferingsIndex();
+      offeringsIndexGeneration = offeringsGeneration;
+    }
+    // Return a copy so callers cannot mutate the cached list.
+    return (offeringsIndex.get(normalized) || []).map((entry) => ({ ...entry }));
   }
 
   function directCandidates(requestedModel) {
@@ -350,6 +368,7 @@ export function createProviderRegistry(config, { host, port }) {
       }
       provider.catalogFetchedAt = Date.now();
       provider.catalogError = '';
+      offeringsGeneration += 1;
       const freeCount = provider.catalogHasPricing
         ? [...provider.catalog.values()].filter(isZeroCost).length
         : null;
@@ -478,6 +497,8 @@ export function createProviderRegistry(config, { host, port }) {
       provider.catalogAttemptedAt = 0;
       provider.catalogError = '';
     }
+    // Adding or clearing a key changes which offerings exist.
+    offeringsGeneration += 1;
     return true;
   }
 

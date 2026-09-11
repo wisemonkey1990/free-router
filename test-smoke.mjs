@@ -546,6 +546,15 @@ const baiMock = http.createServer(async (req, res) => {
           choices: [{ delta: { content: 'bai-ok' }, finish_reason: null }],
         })}\n\n`,
       );
+      // Simulate an upstream that dies mid-stream after committing: drop the
+      // socket without sending [DONE]. The router can no longer fail over, so it
+      // must close the client stream cleanly with an error event and [DONE].
+      // Destroy on a later tick so the first chunk flushes and the router
+      // commits the stream before the connection resets.
+      if (body.messages?.some((message) => message.content === 'interrupt-stream')) {
+        setTimeout(() => res.socket?.destroy(), 50);
+        return;
+      }
       res.end('data: [DONE]\n\n');
       return;
     }
@@ -1072,6 +1081,17 @@ try {
   assert.match(stream, /bai-ok/);
   assert.doesNotMatch(stream, /thinking only/);
 
+  // A cheap liveness probe: ok/version only, and none of the heavy detail that
+  // /health computes, so orchestrators can poll it without running the ranking.
+  const livez = await fetch(`http://127.0.0.1:${routerPort}/healthz`);
+  assert.equal(livez.status, 200);
+  const livezBody = await livez.json();
+  assert.equal(livezBody.ok, true);
+  assert.equal(livezBody.version, PACKAGE_VERSION);
+  assert.equal(livezBody.routes, undefined);
+  assert.equal(livezBody.usage, undefined);
+  assert.equal(livezBody.discovery, undefined);
+
   const directTokenRouterResponse = await fetch(
     `http://127.0.0.1:${routerPort}/v1/chat/completions`,
     {
@@ -1453,6 +1473,31 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
+  // An upstream that dies after committing the stream cannot be failed over, so
+  // the router must terminate the client stream cleanly: the partial content it
+  // already sent, then an error event, then the [DONE] sentinel. Run after the
+  // usage-count assertions above, since this adds one more served bai request.
+  const interruptResponse = await fetch(
+    `http://127.0.0.1:${routerPort}/v1/chat/completions`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'test-route',
+        stream: true,
+        messages: [
+          { role: 'user', content: 'force-token-failure' },
+          { role: 'user', content: 'interrupt-stream' },
+        ],
+      }),
+    },
+  );
+  assert.equal(interruptResponse.status, 200);
+  const interruptStream = await interruptResponse.text();
+  assert.match(interruptStream, /bai-ok/);
+  assert.match(interruptStream, /"error"/);
+  assert.match(interruptStream, /\[DONE\]/);
+
   const base = `http://127.0.0.1:${routerPort}`;
   const pageResponse = await fetch(`${base}/`);
   assert.equal(pageResponse.status, 200);
@@ -1553,7 +1598,11 @@ try {
   const envBody = fs.readFileSync(envPath, 'utf8');
   assert.equal(envBody, 'BAI_API_KEY=bai-rotated-key\n');
   assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
-  assert.equal(process.env.NODE_OPTIONS, undefined);
+  // The earlier newline-injection attempt must not have written a second
+  // assignment. Assert against the env file the router actually writes, not
+  // against this test process's own environment (which the CI runner may set,
+  // e.g. NODE_OPTIONS=--max-old-space-size).
+  assert.equal(/NODE_OPTIONS/.test(envBody), false);
 
   // The new key has to apply without a restart, and the redactor has to learn
   // it so it cannot leak back out through an upstream payload.
