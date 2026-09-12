@@ -2,9 +2,10 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { loadProjectEnv } from './env.mjs';
 import {
   createProviderRegistry,
   isChatModel,
@@ -28,30 +29,7 @@ import { displayPath, maskSecret, renderPage, updateEnvFile, validateSecret } fr
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(fs.readFileSync(path.join(HERE, 'package.json'), 'utf8')).version;
 
-function loadEnvFile(file) {
-  if (!fs.existsSync(file)) return;
-  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
-    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (!match) continue;
-    let value = match[2];
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (!value || process.env[match[1]]) continue;
-    process.env[match[1]] = value;
-  }
-}
-
-const envCandidates = [
-  path.join(HERE, '.env'),
-  path.join(os.homedir(), '.hermes', '.env'),
-];
-for (const file of envCandidates) {
-  if (file) loadEnvFile(file);
-}
+loadProjectEnv(HERE);
 
 const CONFIG_PATH = process.env.FREE_ROUTER_CONFIG || path.join(HERE, 'config.json');
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -66,6 +44,23 @@ const PORT = Number(process.env.FREE_ROUTER_PORT || config.port || 8787);
 const ATTEMPT_TIMEOUT_MS = Number(
   process.env.FREE_ROUTER_ATTEMPT_TIMEOUT_MS || config.attemptTimeoutMs || 180000,
 );
+// Time allowed to receive response headers before giving up on an upstream and
+// failing over. A slow first byte is a dead provider; a slow long answer is not.
+const CONNECT_TIMEOUT_MS = Math.max(
+  1000,
+  Number(config.connectTimeoutMs || Math.min(ATTEMPT_TIMEOUT_MS, 60000)),
+);
+// A streaming answer can legitimately run longer than ATTEMPT_TIMEOUT_MS, so a
+// committed stream is bounded by the gap between chunks, not by total duration.
+const STREAM_IDLE_TIMEOUT_MS = Math.max(
+  1000,
+  Number(config.streamIdleTimeoutMs || ATTEMPT_TIMEOUT_MS),
+);
+// Ceilings on a single client request across all fallback attempts. 0 disables
+// the ceiling. The budget stops the router from burning a long tail of upstream
+// calls after the client has almost certainly given up.
+const REQUEST_BUDGET_MS = Math.max(0, Number(config.requestBudgetMs || 0));
+const MAX_ATTEMPTS = Math.max(0, Number(config.maxAttempts || 0));
 const CATALOG_REFRESH_MS = Number(config.catalogRefreshMs || 900000);
 const registry = createProviderRegistry(config, { host: HOST, port: PORT });
 const PROVIDERS = registry.providers;
@@ -75,9 +70,11 @@ const DISCOVERY_INTERVAL_MS = Number(discoveryConfig.intervalMs || 7 * 24 * 60 *
 const DISCOVERY_ROUTE = String(discoveryConfig.route || 'free-best');
 // How long a "not free" verdict stands before the model is worth asking again.
 const VERDICT_RETRY_MS = Number(discoveryConfig.verdictRetryMs || DISCOVERY_INTERVAL_MS);
+// FREE_ROUTER_STATE_FILE lets a container point discovery/usage state at a
+// mounted volume without baking an absolute path into config.json.
 const DISCOVERY_STATE_PATH = path.resolve(
   path.dirname(CONFIG_PATH),
-  discoveryConfig.stateFile || 'discovered-free-models.json',
+  process.env.FREE_ROUTER_STATE_FILE || discoveryConfig.stateFile || 'discovered-free-models.json',
 );
 function compilePatterns(patterns, label) {
   const compiled = [];
@@ -101,6 +98,54 @@ const EVALUATION_MAX_TOKENS = Number(evaluationConfig.maxTokens || 4000);
 // older scale get recomputed instead of being compared against new ones.
 const EVALUATION_VERSION = 2;
 const EVALUATION_MAX_PER_RUN = Math.max(1, Number(evaluationConfig.maxPerRun || 8));
+// How many times each model is asked the benchmark; the median score and
+// latency are kept. 1 preserves the original single-cold-sample behaviour.
+// Raise it (at the cost of one request per extra sample) to smooth out a model
+// that answers inconsistently or has a noisy first-call latency.
+const EVALUATION_SAMPLES = Math.max(1, Number(evaluationConfig.samples || 1));
+// The default reasoning benchmark. Externalised so an operator can swap it for
+// private questions if they suspect the public ones have leaked into training
+// data. `parseBonus` rewards returning any valid JSON object; each item adds its
+// weight when the answer matches (numeric expected values compare numerically,
+// strings compare exactly). The default weights total 65 to stay on the same
+// scale as the configured baseline anchors.
+const DEFAULT_BENCHMARK = {
+  prompt:
+    'Return ONLY one JSON object with keys token, crt, trace, path, sequence, binary, ' +
+    'derange, recur, modpow. ' +
+    'No markdown and no explanation. token must be "OX-RANK-7". ' +
+    'crt: smallest positive integer n where n%7=3, n%11=5, n%13=9. ' +
+    'trace: output of JavaScript: let a=[1,2,3,4]; for(let i=0;i<a.length;i++){if(a[i]%2===0)a.splice(i,1)} console.log(a.join("-")). ' +
+    'path: shortest distance A to E for undirected edges A-B:4,A-C:2,C-B:1,B-D:5,C-D:8,C-E:10,D-E:2. ' +
+    'sequence: next number after 2,6,12,20,30. ' +
+    'binary: number of binary strings of length 8 with no consecutive ones. ' +
+    'derange: number of permutations of 1,2,3,4,5 where no value stays in its own position. ' +
+    'recur: a(1)=1, and for n>1 a(n)=a(n-1)+n when n is even else a(n-1)*2; give a(6). ' +
+    'modpow: 7^222 mod 100.',
+  parseBonus: 3,
+  items: [
+    { key: 'token', expected: 'OX-RANK-7', weight: 2 },
+    { key: 'crt', expected: 269, weight: 8 },
+    { key: 'trace', expected: '1-3', weight: 8 },
+    { key: 'path', expected: 10, weight: 6 },
+    { key: 'sequence', expected: 42, weight: 4 },
+    { key: 'binary', expected: 55, weight: 6 },
+    { key: 'derange', expected: 44, weight: 10 },
+    { key: 'recur', expected: 26, weight: 10 },
+    { key: 'modpow', expected: 49, weight: 8 },
+  ],
+};
+const EVALUATION_BENCHMARK = (() => {
+  const custom = evaluationConfig.benchmark;
+  if (!custom || typeof custom !== 'object') return DEFAULT_BENCHMARK;
+  return {
+    prompt: typeof custom.prompt === 'string' && custom.prompt ? custom.prompt : DEFAULT_BENCHMARK.prompt,
+    parseBonus: Number.isFinite(Number(custom.parseBonus))
+      ? Number(custom.parseBonus)
+      : DEFAULT_BENCHMARK.parseBonus,
+    items: Array.isArray(custom.items) && custom.items.length ? custom.items : DEFAULT_BENCHMARK.items,
+  };
+})();
 const RANK_USAGE_WEIGHT = Math.max(0, Number(evaluationConfig.usageWeight ?? 12));
 const RANK_USAGE_MIN_REQUESTS = Math.max(1, Number(evaluationConfig.usageMinRequests || 20));
 const PINNED_MODELS = new Set(evaluationConfig.pinnedModels || []);
@@ -293,18 +338,39 @@ function excludedModelIds() {
   return [...ids].sort();
 }
 
-function usageDay(at = Date.now()) {
+function formatUsageDay(at) {
   const date = new Date(at);
   if (USAGE_DAY_FORMATTER) return USAGE_DAY_FORMATTER.format(date);
   const pad = (value) => String(value).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
+// Ranking calls these hundreds of times per request, and the Intl formatter is
+// the cost. A short TTL keeps the label at most a second stale — irrelevant for
+// a per-day counter — while collapsing a burst of lookups to one format. A TTL
+// (rather than a day-index bucket) stays correct under any usage.timezone,
+// whose day boundary need not line up with UTC midnight.
+const USAGE_DAY_CACHE_TTL_MS = 1000;
+let usageDayCache = { at: 0, day: '' };
+function usageDay(at) {
+  if (at !== undefined) return formatUsageDay(at);
+  const now = Date.now();
+  if (now - usageDayCache.at < USAGE_DAY_CACHE_TTL_MS) return usageDayCache.day;
+  usageDayCache = { at: now, day: formatUsageDay(now) };
+  return usageDayCache.day;
+}
+
+let usageDaysCache = { at: 0, days: null };
 function usageDays() {
+  const now = Date.now();
+  if (usageDaysCache.days && now - usageDaysCache.at < USAGE_DAY_CACHE_TTL_MS) {
+    return usageDaysCache.days;
+  }
   const days = [];
   for (let offset = 0; offset < USAGE_RETENTION_DAYS; offset += 1) {
-    days.push(usageDay(Date.now() - offset * 86400000));
+    days.push(formatUsageDay(now - offset * 86400000));
   }
+  usageDaysCache = { at: now, days };
   return days;
 }
 
@@ -647,13 +713,19 @@ function orderByModelThenProvider(candidates, configuredSet, configuredIndex) {
     }
     group.members.push({ candidate, originalIndex });
   });
-  const ranked = [...groups.values()].sort((left, right) => {
-    const a = groupRank(left, configuredSet, configuredIndex);
-    const b = groupRank(right, configuredSet, configuredIndex);
-    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-    if (a.pinned) return a.tie - b.tie;
-    return b.score - a.score || a.tie - b.tie;
-  });
+  // Rank each group once up front rather than recomputing it on every sort
+  // comparison (which would be O(n log n) groupRank calls, each formatting
+  // usage dates), then sort the precomputed pairs.
+  const ranked = [...groups.values()]
+    .map((group) => ({ group, rank: groupRank(group, configuredSet, configuredIndex) }))
+    .sort((left, right) => {
+      const a = left.rank;
+      const b = right.rank;
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      if (a.pinned) return a.tie - b.tie;
+      return b.score - a.score || a.tie - b.tie;
+    })
+    .map((entry) => entry.group);
   const expanded = [];
   const present = new Set();
   const expandedSlugs = new Set();
@@ -766,8 +838,39 @@ function metadataScore(model) {
   return Math.round(score * 10) / 10;
 }
 
+function median(values) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// A numeric expected value matches numerically (so "269" and 269 both pass); a
+// string expected value must match exactly after trimming.
+function benchmarkAnswerMatches(actual, expected) {
+  if (typeof expected === 'number') return Number(actual) === expected;
+  return String(actual ?? '').trim() === String(expected);
+}
+
+function scoreBenchmarkAnswers(answers) {
+  let score = answers ? Number(EVALUATION_BENCHMARK.parseBonus) || 0 : 0;
+  if (answers) {
+    for (const item of EVALUATION_BENCHMARK.items) {
+      if (benchmarkAnswerMatches(answers[item.key], item.expected)) {
+        score += Number(item.weight) || 0;
+      }
+    }
+  }
+  return score;
+}
+
+function latencyScoreFor(latencyMs) {
+  // Deliberately small: one cold sample should not swing the ranking more than
+  // any capability signal does.
+  return latencyMs <= 5000 ? 6 : latencyMs <= 15000 ? 4 : latencyMs <= 30000 ? 2 : 0;
+}
+
 async function evaluateModel(target) {
-  const startedAt = Date.now();
   const candidate =
     typeof target === 'string'
       ? { provider: registry.discoveryProvider, model: target }
@@ -775,72 +878,59 @@ async function evaluateModel(target) {
   const model = candidateMetadata(candidate);
   const supported = new Set(model?.supported_parameters || []);
   const evaluationBody = {
-    messages: [
-      {
-        role: 'user',
-        content:
-          'Return ONLY one JSON object with keys token, crt, trace, path, sequence, binary, ' +
-          'derange, recur, modpow. ' +
-          'No markdown and no explanation. token must be "OX-RANK-7". ' +
-          'crt: smallest positive integer n where n%7=3, n%11=5, n%13=9. ' +
-          'trace: output of JavaScript: let a=[1,2,3,4]; for(let i=0;i<a.length;i++){if(a[i]%2===0)a.splice(i,1)} console.log(a.join("-")). ' +
-          'path: shortest distance A to E for undirected edges A-B:4,A-C:2,C-B:1,B-D:5,C-D:8,C-E:10,D-E:2. ' +
-          'sequence: next number after 2,6,12,20,30. ' +
-          'binary: number of binary strings of length 8 with no consecutive ones. ' +
-          'derange: number of permutations of 1,2,3,4,5 where no value stays in its own position. ' +
-          'recur: a(1)=1, and for n>1 a(n)=a(n-1)+n when n is even else a(n-1)*2; give a(6). ' +
-          'modpow: 7^222 mod 100.',
-      },
-    ],
+    messages: [{ role: 'user', content: EVALUATION_BENCHMARK.prompt }],
     temperature: 0,
     max_tokens: EVALUATION_MAX_TOKENS,
   };
   if (supported.has('reasoning') || supported.has('reasoning_effort')) {
     evaluationBody.reasoning = { effort: 'low' };
   }
-  const result = await attemptJson(candidate, evaluationBody);
-  const latencyMs = Date.now() - startedAt;
-  recordUsage(candidate, result.ok ? 'ok' : result.kind || 'other');
-  if (!result.ok) {
-    // The refusal is the useful part when probing: it says whether the model is
-    // offered for free at all, which no catalog on a price-free provider does.
-    applyProviderVerdict(candidate, result);
+
+  // Sample the model EVALUATION_SAMPLES times and keep the median so one lucky
+  // or unlucky answer does not decide the ranking. The first failure ends the
+  // run: a model that will not serve one request will not serve the rest, and
+  // its refusal is the verdict signal we want on a price-free provider.
+  const benchmarkScores = [];
+  const latencies = [];
+  let lastFailure = null;
+  for (let sample = 0; sample < EVALUATION_SAMPLES; sample += 1) {
+    const startedAt = Date.now();
+    const result = await attemptJson(candidate, evaluationBody);
+    const latencyMs = Date.now() - startedAt;
+    recordUsage(candidate, result.ok ? 'ok' : result.kind || 'other');
+    if (!result.ok) {
+      lastFailure = { latencyMs, error: `${result.status} ${result.reason}`.slice(0, 300) };
+      // The refusal is the useful part when probing: it says whether the model
+      // is offered for free at all, which no price-free catalog does.
+      applyProviderVerdict(candidate, result);
+      if (!benchmarkScores.length) break;
+      continue;
+    }
+    // Serving the request is itself the proof, on a key with no billing.
+    if (!PROVIDERS.get(candidate.provider)?.catalogHasPricing) {
+      setModelVerdict(candidateKey(candidate), {
+        free: true,
+        reason: 'served a free-tier request',
+      });
+    }
+    benchmarkScores.push(scoreBenchmarkAnswers(parseEvaluationAnswers(evaluationText(result.payload))));
+    latencies.push(latencyMs);
+  }
+
+  if (!benchmarkScores.length) {
     return {
       status: 'pending',
       version: EVALUATION_VERSION,
       attemptedAt: new Date().toISOString(),
-      latencyMs,
-      error: `${result.status} ${result.reason}`.slice(0, 300),
+      latencyMs: lastFailure?.latencyMs || 0,
+      error: lastFailure?.error || 'no successful evaluation sample',
     };
   }
-  // Serving the request is itself the proof, on a key with no billing.
-  if (!PROVIDERS.get(candidate.provider)?.catalogHasPricing) {
-    setModelVerdict(candidateKey(candidate), {
-      free: true,
-      reason: 'served a free-tier request',
-    });
-  }
 
-  // Weights total 65 so scores stay on the same scale as the configured
-  // baseline anchors. The last three items carry most of the discrimination;
-  // the earlier ones are saturated by every competent model.
-  const answers = parseEvaluationAnswers(evaluationText(result.payload));
-  let benchmarkScore = 0;
-  if (answers) benchmarkScore += 3;
-  if (answers?.token === 'OX-RANK-7') benchmarkScore += 2;
-  if (Number(answers?.crt) === 269) benchmarkScore += 8;
-  if (String(answers?.trace) === '1-3') benchmarkScore += 8;
-  if (Number(answers?.path) === 10) benchmarkScore += 6;
-  if (Number(answers?.sequence) === 42) benchmarkScore += 4;
-  if (Number(answers?.binary) === 55) benchmarkScore += 6;
-  if (Number(answers?.derange) === 44) benchmarkScore += 10;
-  if (Number(answers?.recur) === 26) benchmarkScore += 10;
-  if (Number(answers?.modpow) === 49) benchmarkScore += 8;
-
+  const benchmarkScore = Math.round(median(benchmarkScores) * 10) / 10;
+  const latencyMs = Math.round(median(latencies));
   const modelMetadataScore = metadataScore(candidateMetadata(candidate));
-  // Deliberately small: this is a single cold sample and used to swing the
-  // ranking more than any capability signal did.
-  const latencyScore = latencyMs <= 5000 ? 6 : latencyMs <= 15000 ? 4 : latencyMs <= 30000 ? 2 : 0;
+  const latencyScore = latencyScoreFor(latencyMs);
   const score = Math.round((benchmarkScore + modelMetadataScore + latencyScore) * 10) / 10;
   return {
     status: 'scored',
@@ -851,6 +941,7 @@ async function evaluateModel(target) {
     metadataScore: modelMetadataScore,
     latencyScore,
     latencyMs,
+    samples: benchmarkScores.length,
   };
 }
 
@@ -1156,6 +1247,16 @@ function candidateModels(requestedModel, body) {
   return filterCandidates(configured || registry.directCandidates(requestedModel), body, requestedModel);
 }
 
+// A daily limit the provider stated for itself is authoritative, so a model
+// that has spent it will only answer with a 429. Skipping it up front saves a
+// guaranteed-wasted round trip. A hand-configured limit is a guess, so it never
+// blocks a request (the router keeps sending, as documented).
+function dailyQuotaSpent(candidate) {
+  const key = candidateKey(candidate);
+  if (dailyLimitSource(key) !== 'provider') return false;
+  return usageForKey(key).remainingToday === 0;
+}
+
 function filterCandidates(configured, body, requestedModel) {
   const needs = requestNeeds(body);
   const active = [];
@@ -1178,6 +1279,13 @@ function filterCandidates(configured, body, requestedModel) {
       });
       continue;
     }
+    if (dailyQuotaSpent(candidate)) {
+      skipped.push({
+        model: candidateKey(candidate),
+        reason: 'provider daily quota spent for today',
+      });
+      continue;
+    }
     active.push(candidate);
   }
 
@@ -1196,6 +1304,15 @@ function filterCandidates(configured, body, requestedModel) {
 
   if (skipped.length) log(`${requestedModel}: skipped ${skipped.length} candidate(s)`, skipped);
   return active;
+}
+
+// Upstream error text can echo request headers or parameters, so any provider
+// reason returned to the client or written to the log passes through the same
+// redactor as outbound payloads.
+function redactText(text) {
+  const value = String(text ?? '');
+  if (!secretRedactor || !value) return value;
+  return secretRedactor.redact(value).value;
 }
 
 function sanitizeUpstreamBody(body, candidate) {
@@ -1286,13 +1403,21 @@ function errorSummary(status, raw) {
 
 async function fetchModel(candidate, body, clientSignal) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('attempt timeout')), ATTEMPT_TIMEOUT_MS);
+  let timer = null;
+  // A single re-armable deadline: the connect phase uses one duration, then the
+  // caller resets it to the read or idle budget once headers arrive.
+  const rearm = (ms) => {
+    if (timer) clearTimeout(timer);
+    timer = ms > 0 ? setTimeout(() => controller.abort(new Error('attempt timeout')), ms) : null;
+  };
   const abortFromClient = () => controller.abort(new Error('client disconnected'));
   clientSignal?.addEventListener('abort', abortFromClient, { once: true });
   const cleanup = () => {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
+    timer = null;
     clientSignal?.removeEventListener('abort', abortFromClient);
   };
+  rearm(CONNECT_TIMEOUT_MS);
   try {
     const provider = PROVIDERS.get(candidate.provider);
     if (!provider?.baseUrl || !provider.apiKey) {
@@ -1304,7 +1429,7 @@ async function fetchModel(candidate, body, clientSignal) {
       body: JSON.stringify(sanitizeUpstreamBody(body, candidate)),
       signal: controller.signal,
     });
-    return { response, cleanup };
+    return { response, cleanup, rearm };
   } catch (error) {
     cleanup();
     throw error;
@@ -1314,8 +1439,9 @@ async function fetchModel(candidate, body, clientSignal) {
 async function attemptJson(candidate, body, clientSignal) {
   let response;
   let cleanup = () => {};
+  let rearm = (_ms) => {};
   try {
-    ({ response, cleanup } = await fetchModel(
+    ({ response, cleanup, rearm } = await fetchModel(
       candidate,
       { ...body, stream: false },
       clientSignal,
@@ -1329,6 +1455,8 @@ async function attemptJson(candidate, body, clientSignal) {
       kind: classifyFailure(0, String(error), timedOut),
     };
   }
+  // Headers arrived; allow the full attempt window to read the body.
+  rearm(ATTEMPT_TIMEOUT_MS);
   let raw;
   try {
     raw = await response.text();
@@ -1379,11 +1507,29 @@ async function attemptJson(candidate, body, clientSignal) {
   };
 }
 
+// Once a stream is committed the client is already reading bytes, so a
+// mid-stream failure can no longer fail over. Close the SSE stream cleanly with
+// an error event and the [DONE] sentinel so the client sees a definite end
+// rather than a silently truncated response.
+function endStreamWithError(res, message) {
+  try {
+    const frame = JSON.stringify({
+      error: { message: String(message || 'upstream stream interrupted'), type: 'upstream_error' },
+    });
+    res.write(`data: ${frame}\n\n`);
+    res.write('data: [DONE]\n\n');
+  } catch {
+    // The socket may already be gone; ending is all that is left to do.
+  }
+  res.end();
+}
+
 async function attemptStream(candidate, body, res, clientSignal) {
   let response;
   let cleanup = () => {};
+  let rearm = (_ms) => {};
   try {
-    ({ response, cleanup } = await fetchModel(
+    ({ response, cleanup, rearm } = await fetchModel(
       candidate,
       { ...body, stream: true },
       clientSignal,
@@ -1420,6 +1566,9 @@ async function attemptStream(candidate, body, res, clientSignal) {
     return { ok: false, status: 502, reason: 'empty response body', kind: 'empty' };
   }
 
+  // Headers are in; from here a stalled stream is bounded by the idle gap
+  // between chunks rather than by the connect deadline.
+  rearm(STREAM_IDLE_TIMEOUT_MS);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const extractor = geminiStreamExtractor(candidate);
@@ -1436,12 +1585,14 @@ async function attemptStream(candidate, body, res, clientSignal) {
       extractor?.flush();
       cleanup();
       if (committed) {
-        res.end();
+        endStreamWithError(res, `upstream stream interrupted: ${error}`);
         return { ok: true, candidate, interrupted: true };
       }
       return { ok: false, status: 502, reason: String(error), kind: 'serverError' };
     }
     if (read.done) break;
+    // Progress resets the idle deadline.
+    rearm(STREAM_IDLE_TIMEOUT_MS);
     const bytes = Buffer.from(read.value);
     const text = decoder.decode(read.value, { stream: true });
     extractor?.push(text);
@@ -1572,6 +1723,11 @@ async function handleChat(req, res) {
     });
   }
 
+  // A short id ties the interleaved `trying`/`failed`/`selected` lines of one
+  // request together when several are in flight at once.
+  const rid = randomUUID().slice(0, 8);
+  const rlog = (message, detail) => log(`[req ${rid}] ${message}`, detail);
+
   const requestedModel = String(body.model || 'free-best');
   await refreshCatalog();
   const candidates = candidateModels(requestedModel, body);
@@ -1591,10 +1747,26 @@ async function handleChat(req, res) {
     if (!res.writableEnded) clientController.abort();
   });
 
+  const startedAt = Date.now();
+  let attempts = 0;
+  let budgetExhausted = false;
   for (const candidate of candidates) {
     if (clientController.signal.aborted) return;
     if (failedProviders.has(candidate.provider)) continue;
-    log(`trying ${candidateKey(candidate)} for ${requestedModel}`);
+    // Stop spending upstream calls the client is unlikely to still be waiting
+    // for, rather than walking the whole fallback list every time.
+    if (REQUEST_BUDGET_MS && Date.now() - startedAt >= REQUEST_BUDGET_MS) {
+      rlog(`request budget of ${REQUEST_BUDGET_MS}ms spent; stopping fallback`);
+      budgetExhausted = true;
+      break;
+    }
+    if (MAX_ATTEMPTS && attempts >= MAX_ATTEMPTS) {
+      rlog(`reached max ${MAX_ATTEMPTS} attempt(s); stopping fallback`);
+      budgetExhausted = true;
+      break;
+    }
+    attempts += 1;
+    rlog(`trying ${candidateKey(candidate)} for ${requestedModel}`);
     const result = body.stream
       ? await attemptStream(candidate, body, res, clientController.signal)
       : await attemptJson(candidate, body, clientController.signal);
@@ -1608,7 +1780,7 @@ async function handleChat(req, res) {
         selectedAt: new Date().toISOString(),
       });
       if (!body.stream) {
-        log(`selected ${candidateKey(candidate)}`);
+        rlog(`selected ${candidateKey(candidate)}`);
         return sendJson(res, 200, result.payload, {
           'X-Free-Router-Model': candidate.model,
           'X-Free-Router-Provider': candidate.provider,
@@ -1621,29 +1793,32 @@ async function handleChat(req, res) {
       candidate,
       clientController.signal.aborted ? 'aborted' : result.kind || 'other',
     );
+    const reason = redactText(result.reason);
     failures.push({
       provider: candidate.provider,
       model: candidate.model,
       status: result.status,
-      reason: result.reason,
+      reason,
     });
     const providerWaitMs = applyProviderVerdict(candidate, result);
     if (result.kind) setCooldown(candidate, result.kind, result.reason, providerWaitMs);
-    log(`failed ${candidateKey(candidate)}: ${result.status} ${result.reason}`);
+    rlog(`failed ${candidateKey(candidate)}: ${result.status} ${reason}`);
     if (result.fatal) failedProviders.add(candidate.provider);
     // The same history will 400 on every Gemini thinking model. Stop here so
     // 3.8-flash, 3.7-flash, and Flash-Lite are not each billed for a refusal.
     if (isMissingThoughtSignatureError(result.status, result.reason)) {
-      log(`skipping remaining ${candidate.provider} candidates: missing thought_signature`);
+      rlog(`skipping remaining ${candidate.provider} candidates: missing thought_signature`);
       failedProviders.add(candidate.provider);
     }
   }
 
   if (!res.headersSent) {
-    sendJson(res, 502, {
+    sendJson(res, budgetExhausted ? 504 : 502, {
       error: {
-        message: `All models failed for route ${requestedModel}`,
-        type: 'free_router_exhausted',
+        message: budgetExhausted
+          ? `Request budget spent before a free model answered for route ${requestedModel}`
+          : `All models failed for route ${requestedModel}`,
+        type: budgetExhausted ? 'free_router_budget_exhausted' : 'free_router_exhausted',
         failures,
       },
     });
@@ -1704,12 +1879,21 @@ function uiProviderState() {
     catalogModels: provider.usesCatalog ? provider.catalog.size : null,
     catalogError: catalogHealth[provider.name]?.catalogError || null,
     unavailableModels: catalogHealth[provider.name]?.unavailableModels || [],
+    // The default and discovery providers are the registry's backbone and can
+    // only be removed by editing config.json, so the UI hides Delete for them.
+    removable: provider.name !== registry.defaultProvider
+      && provider.name !== registry.discoveryProvider,
   }));
 }
 
 function uiRouteState() {
   const routes = routeStatus();
   const entries = routes[DISCOVERY_ROUTE] || Object.values(routes)[0] || [];
+  // Only entries written in config.json can be reordered or deleted from the
+  // UI; discovered models are auto-managed and rank on their own score.
+  const configuredKeys = new Set(
+    (config.routes?.[DISCOVERY_ROUTE] || []).map(normalizeCandidate).map(candidateKey),
+  );
   return entries.map((entry) => ({
     priority: entry.priority,
     provider: entry.provider,
@@ -1719,8 +1903,248 @@ function uiRouteState() {
     cooldownSeconds: entry.cooldownSeconds,
     scoreAdjustment: entry.scoreAdjustment,
     providerConfigured: Boolean(PROVIDERS.get(entry.provider)?.apiKey),
+    configured: configuredKeys.has(`${entry.provider}:${entry.id}`),
     usage: entry.usage,
   }));
+}
+
+// Atomically rewrite config.json after a UI-driven change to providers or
+// routes. config.json is plain JSON (no comments), so a full re-serialize is
+// lossless. Written 0644: it holds no secrets, only structure; keys live in
+// the 0600 env file.
+function persistConfig() {
+  const temporaryPath = `${CONFIG_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o644 });
+  fs.renameSync(temporaryPath, CONFIG_PATH);
+}
+
+function isValidBaseUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+const PROVIDER_ID_RE = /^[a-z][a-z0-9_-]*$/;
+
+// The configured route in its raw config.json order, including entries whose
+// provider has no key yet. This is the editable source of truth the UI reorders
+// and deletes against; the scored `routes` list drops keyless entries and
+// re-ranks, so it cannot drive a stable priority editor.
+function uiConfiguredRoute() {
+  const now = Date.now();
+  const configured = (config.routes?.[DISCOVERY_ROUTE] || [])
+    .map(normalizeCandidate)
+    .filter((candidate) => candidate.model);
+  return configured.map((candidate, index) => {
+    const key = candidateKey(candidate);
+    const provider = PROVIDERS.get(candidate.provider);
+    const cooldown = cooldowns.get(key);
+    const model = candidateMetadata(candidate);
+    return {
+      order: index + 1,
+      provider: candidate.provider,
+      model: candidate.model,
+      pinned: PINNED_MODELS.has(key) || PINNED_MODELS.has(candidate.model),
+      providerKnown: Boolean(provider),
+      providerConfigured: Boolean(provider?.apiKey),
+      zeroCost: provider?.catalogHasPricing ? (model ? isZeroCost(model) : null) : true,
+      cooldownSeconds: cooldown && cooldown.until > now ? Math.ceil((cooldown.until - now) / 1000) : 0,
+      usage: usageForKey(key),
+    };
+  });
+}
+
+async function handleProviderMutation(req, res) {
+  let body;
+  try {
+    body = await readJson(req, 64 * 1024);
+  } catch (error) {
+    return sendJson(res, 400, {
+      error: { message: String(error), type: 'invalid_request_error' },
+    });
+  }
+
+  const action = String(body.action || 'add');
+  const name = String(body.name || '').trim();
+  if (!PROVIDER_ID_RE.test(name)) {
+    return sendJson(res, 400, {
+      error: {
+        message: 'provider id must be lowercase letters, digits, _ or - and start with a letter',
+        type: 'invalid_request_error',
+      },
+    });
+  }
+
+  if (action === 'delete') {
+    const provider = PROVIDERS.get(name);
+    if (!provider) {
+      return sendJson(res, 400, {
+        error: { message: `unknown provider: ${name}`, type: 'invalid_request_error' },
+      });
+    }
+    const result = registry.removeProvider(name);
+    if (!result.ok) {
+      return sendJson(res, 400, { error: { message: result.error, type: 'invalid_request_error' } });
+    }
+    delete config.providers[name];
+    // Drop any route entries that pointed at the now-gone provider.
+    for (const route of Object.keys(config.routes || {})) {
+      config.routes[route] = (config.routes[route] || [])
+        .map(normalizeCandidate)
+        .filter((candidate) => candidate.provider !== name)
+        .map((candidate) => ({ provider: candidate.provider, model: candidate.model }));
+    }
+    try {
+      updateEnvFile(UI_ENV_PATH, { [provider.keyEnv]: '' });
+    } catch (error) {
+      log(`failed to clear ${provider.keyEnv} while deleting ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    refreshSecretRedactor();
+    try {
+      persistConfig();
+    } catch (error) {
+      return sendJson(res, 500, {
+        error: { message: `could not write config: ${error instanceof Error ? error.message : String(error)}`, type: 'config_write_failed' },
+      });
+    }
+    log(`removed provider ${name} via web interface`);
+    return sendJson(res, 200, { ok: true, provider: name, removed: true });
+  }
+
+  if (action !== 'add') {
+    return sendJson(res, 400, {
+      error: { message: `unknown action: ${action}`, type: 'invalid_request_error' },
+    });
+  }
+
+  if (registry.hasProvider(name) || (config.providers && config.providers[name])) {
+    return sendJson(res, 400, {
+      error: { message: `provider ${name} already exists`, type: 'invalid_request_error' },
+    });
+  }
+  const baseUrl = String(body.baseUrl || '').trim();
+  if (!isValidBaseUrl(baseUrl)) {
+    return sendJson(res, 400, {
+      error: { message: 'baseUrl must be a valid http(s) URL', type: 'invalid_request_error' },
+    });
+  }
+  const catalog = body.catalog === true;
+  const freeModels = Array.isArray(body.freeModels)
+    ? body.freeModels.map((id) => String(id).trim()).filter(Boolean)
+    : [];
+  const cfg = { baseUrl };
+  if (catalog) {
+    cfg.catalog = true;
+    cfg.pricing = body.pricing !== false;
+  }
+  if (freeModels.length) cfg.freeModels = freeModels;
+
+  try {
+    registry.addProvider(name, cfg);
+  } catch (error) {
+    return sendJson(res, 400, {
+      error: { message: error instanceof Error ? error.message : String(error), type: 'invalid_request_error' },
+    });
+  }
+  config.providers[name] = cfg;
+
+  const key = typeof body.key === 'string' ? body.key.trim() : '';
+  if (key) {
+    const problem = validateSecret(key);
+    if (problem) {
+      // Roll back the half-added provider so a bad key does not leave a stub.
+      registry.removeProvider(name);
+      delete config.providers[name];
+      return sendJson(res, 400, { error: { message: problem, type: 'invalid_request_error' } });
+    }
+    const provider = PROVIDERS.get(name);
+    try {
+      updateEnvFile(UI_ENV_PATH, { [provider.keyEnv]: key });
+    } catch (error) {
+      registry.removeProvider(name);
+      delete config.providers[name];
+      return sendJson(res, 500, {
+        error: { message: `could not write env file: ${error instanceof Error ? error.message : String(error)}`, type: 'env_write_failed' },
+      });
+    }
+    registry.setApiKey(name, key);
+    refreshSecretRedactor();
+  }
+
+  try {
+    persistConfig();
+  } catch (error) {
+    return sendJson(res, 500, {
+      error: { message: `could not write config: ${error instanceof Error ? error.message : String(error)}`, type: 'config_write_failed' },
+    });
+  }
+  log(`added provider ${name} via web interface`);
+  if (key && catalog) {
+    try {
+      await refreshCatalog(true);
+    } catch (error) {
+      log(`catalog refresh after adding ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return sendJson(res, 200, { ok: true, provider: name, configured: Boolean(key) });
+}
+
+async function handleRouteUpdate(req, res) {
+  let body;
+  try {
+    body = await readJson(req, 256 * 1024);
+  } catch (error) {
+    return sendJson(res, 400, {
+      error: { message: String(error), type: 'invalid_request_error' },
+    });
+  }
+
+  const route = String(body.route || DISCOVERY_ROUTE);
+  if (!config.routes || !Array.isArray(config.routes[route])) {
+    return sendJson(res, 400, {
+      error: { message: `unknown route: ${route}`, type: 'invalid_request_error' },
+    });
+  }
+  if (!Array.isArray(body.entries)) {
+    return sendJson(res, 400, {
+      error: { message: 'entries must be an array of { provider, model }', type: 'invalid_request_error' },
+    });
+  }
+
+  const seen = new Set();
+  const entries = [];
+  for (const raw of body.entries) {
+    const provider = String(raw?.provider || '').trim();
+    const model = String(raw?.model || '').trim();
+    if (!provider || !model) {
+      return sendJson(res, 400, {
+        error: { message: 'each entry needs a provider and a model', type: 'invalid_request_error' },
+      });
+    }
+    if (!registry.hasProvider(provider)) {
+      return sendJson(res, 400, {
+        error: { message: `unknown provider in route: ${provider}`, type: 'invalid_request_error' },
+      });
+    }
+    const key = `${provider}:${model}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push({ provider, model });
+  }
+
+  config.routes[route] = entries;
+  try {
+    persistConfig();
+  } catch (error) {
+    return sendJson(res, 500, {
+      error: { message: `could not write config: ${error instanceof Error ? error.message : String(error)}`, type: 'config_write_failed' },
+    });
+  }
+  log(`updated route ${route} via web interface: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`);
+  return sendJson(res, 200, { ok: true, route, count: entries.length });
 }
 
 async function handleKeyUpdate(req, res) {
@@ -1818,6 +2242,7 @@ async function handler(req, res) {
         providers: uiProviderState(),
         usage: usageSummary(),
         routes: uiRouteState(),
+        configuredRoute: uiConfiguredRoute(),
         unavailableModels: discoveryUnavailableIds,
         excludedByProvider: rejectedConfiguredModels(),
         lastSelection,
@@ -1827,6 +2252,17 @@ async function handler(req, res) {
   }
   if (req.method === 'POST' && url.pathname === '/api/keys') {
     return handleKeyUpdate(req, res);
+  }
+  if (req.method === 'POST' && url.pathname === '/api/providers') {
+    return handleProviderMutation(req, res);
+  }
+  if (req.method === 'POST' && url.pathname === '/api/routes') {
+    return handleRouteUpdate(req, res);
+  }
+  // A cheap liveness probe for orchestrators. Unlike /health it computes no
+  // ranking, usage summary, or catalog snapshot, so it is safe to poll often.
+  if (req.method === 'GET' && (url.pathname === '/healthz' || url.pathname === '/v1/healthz')) {
+    return sendJson(res, 200, { ok: true, service: 'free-router', version: VERSION });
   }
   if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/v1/health')) {
     return sendJson(res, 200, {
