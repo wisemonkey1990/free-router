@@ -233,6 +233,12 @@ svg { display: block; flex: none; }
    a grid item defaults to min-width:auto and would otherwise refuse to shrink
    below the table's min-content width, overflowing the page on narrow screens. */
 main { padding: 18px 0 56px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+/* align-items:start, not stretch: stretch would size Provider keys to match
+   whatever height Route priority's grid track naturally wants (which can be
+   very tall — a route may list dozens of models), which is backwards from
+   what we want and also self-defeating for syncColumnHeights() below, which
+   needs to read Provider keys' own true content height, not a height that
+   stretch already inflated to match its capped sibling. */
 .cols { display: grid; grid-template-columns: minmax(0, 1.32fr) minmax(0, 1fr); gap: 14px; align-items: start; }
 .cols > * { min-width: 0; }
 
@@ -240,15 +246,31 @@ main { padding: 18px 0 56px; display: grid; grid-template-columns: minmax(0, 1fr
 .card {
   background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--r); min-width: 0;
+  display: flex; flex-direction: column; min-height: 0;
 }
 .card-head {
   display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
-  padding: 15px 16px 11px;
+  padding: 15px 16px 11px; flex: none;
 }
 .card-head h2 { font-size: 12.5px; font-weight: 670; margin: 0; letter-spacing: -.005em; }
 .card-head p { margin: 4px 0 0; font-size: 11.5px; line-height: 1.5; color: var(--muted); max-width: 62ch; }
 .card-body { padding: 0 16px 14px; }
 .card-body.pad { padding: 2px 16px 16px; }
+/* A route can list dozens of models while Provider keys rarely holds more
+   than a handful, so letting the grid's own stretch alignment equalise the
+   two cards would drag Provider keys up to match a long route list, leaving
+   it mostly blank. Instead syncColumnHeights() (below, in the script) measures
+   Provider keys' rendered height and sets that as #routes-card's explicit
+   height, so Provider keys always sets the height: a longer route list
+   shrinks this flex body and scrolls inside it, a shorter one grows to fill
+   the rest rather than leaving the two cards mismatched. min-height:0
+   overrides the flex default (min-height:auto, i.e. "never smaller than my
+   content"), which would otherwise defeat both the shrink-to-scroll and the
+   grow-to-fill. On a narrow viewport the two cards stop sharing a row (see
+   the breakpoint below) and syncColumnHeights() clears the height, so the
+   list renders at its own natural size and the page scrolls as a whole, same
+   as everywhere else on mobile. */
+#routes { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 
 /* KPI row ----------------------------------------------------------------- */
 .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
@@ -467,7 +489,7 @@ td.dim { color: var(--muted); }
   <section class="kpis" id="kpis" aria-label="Traffic today"></section>
 
   <div class="cols">
-    <section class="card">
+    <section class="card" id="routes-card">
       <div class="card-head">
         <div>
           <h2>Route priority</h2>
@@ -477,7 +499,7 @@ td.dim { color: var(--muted); }
       <div class="card-body pad" id="routes"><div class="skeleton">Loading route…</div></div>
     </section>
 
-    <section class="card">
+    <section class="card" id="providers-card">
       <div class="card-head">
         <div>
           <h2>Provider keys</h2>
@@ -1054,6 +1076,28 @@ function renderUsage() {
   host.appendChild(wrap);
 }
 
+/* Column height sync -------------------------------------------------------
+   Provider keys sets the height; Route priority always matches it exactly —
+   an explicit height, not a cap, so the two stay equal whichever side has
+   more content: a long route list shrinks its flex body and scrolls inside
+   it, a short one grows to fill the extra space instead of leaving a gap.
+   Only meaningful once the two share a grid row — see the matching
+   breakpoint in the stylesheet. */
+const DESKTOP_COLS_QUERY = "(min-width: 1000.1px)";
+function syncColumnHeights() {
+  const routesCard = el("routes-card");
+  const providersCard = el("providers-card");
+  if (!routesCard || !providersCard) return;
+  if (!window.matchMedia(DESKTOP_COLS_QUERY).matches) {
+    routesCard.style.height = "";
+    return;
+  }
+  const target = providersCard.getBoundingClientRect().height;
+  // A floor keeps a near-empty Provider keys card (one provider, no key set)
+  // from crushing the route list down to a sliver.
+  routesCard.style.height = Math.max(target, 220) + "px";
+}
+
 /* Loading ------------------------------------------------------------------ */
 function renderAll() {
   el("endpoint").textContent = state.endpoint;
@@ -1061,6 +1105,7 @@ function renderAll() {
   renderRoutes();
   renderProviders();
   renderUsage();
+  syncColumnHeights();
 }
 
 async function load() {
@@ -1116,9 +1161,18 @@ addToggle.appendChild(document.createTextNode("Add"));
 addToggle.onclick = () => {
   addForm.hidden = !addForm.hidden;
   if (!addForm.hidden) el("ap-name").focus();
+  syncColumnHeights();
 };
-el("ap-cancel").onclick = () => { addForm.hidden = true; addForm.reset(); el("ap-pricing-wrap").hidden = true; };
-el("ap-catalog").onchange = () => { el("ap-pricing-wrap").hidden = !el("ap-catalog").checked; };
+el("ap-cancel").onclick = () => {
+  addForm.hidden = true;
+  addForm.reset();
+  el("ap-pricing-wrap").hidden = true;
+  syncColumnHeights();
+};
+el("ap-catalog").onchange = () => {
+  el("ap-pricing-wrap").hidden = !el("ap-catalog").checked;
+  syncColumnHeights();
+};
 addForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const name = el("ap-name").value.trim();
@@ -1164,6 +1218,12 @@ setInterval(() => {
 }, 1000);
 
 setInterval(() => refresh(true), 15000);
+
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(syncColumnHeights, 120);
+});
 
 load().catch((error) => {
   banner("Cannot reach the gateway: " + String(error.message || error));
