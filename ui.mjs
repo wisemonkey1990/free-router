@@ -80,22 +80,29 @@ const PAGE = `<!doctype html>
 <meta name="referrer" content="no-referrer">
 <title>Free Router</title>
 <style>
-/* Graphite Instrument: cool graphite neutrals, violet accent, hairline
-   elevation (no card shadows), 6px radius, tight density, monospace-forward. */
+/* Switchboard: warm graphite neutrals (not the cool blue-slate that reads as
+   a generic template) with a single muted amber signal color — the one lit
+   lamp on an old routing board — reserved for what's live: a pinned route,
+   a focused control, quota still on hand. Buttons and the brand mark are
+   flat fills, no gradients or glow. Hairline elevation (no card shadows),
+   6px radius, tight density, monospace-forward. */
 :root {
   color-scheme: light;
-  --page: #f6f7f9;
+  --page: #f4f3f0;
   --surface: #ffffff;
-  --surface-2: #f1f3f6;
-  --surface-3: #e7eaef;
-  --ink: #0f1115;
-  --ink-2: #4a5160;
-  --muted: #79818f;
-  --line: #e3e6eb;
-  --line-2: #cdd2da;
-  --accent: #4a3aa7;
-  --accent-2: #3b2e88;
-  --accent-wash: #eeebfa;
+  --surface-2: #ece9e2;
+  --surface-3: #e0dbd1;
+  --ink: #1c1a16;
+  --ink-2: #57534a;
+  --muted: #8b8579;
+  --line: #e1ddd2;
+  --line-2: #c7c0b1;
+  --accent: #8a5a12;
+  --accent-2: #714a0e;
+  --accent-wash: #f6ecd8;
+  /* Light-mode accent is dark enough for white text; dark-mode accent is a
+     light amber, so its button text has to go the other way. */
+  --on-accent: #ffffff;
   /* Status hues are fixed in both modes: only the washes follow the mode. */
   --good: #0ca30c;
   --good-wash: #e3f3e3;
@@ -112,18 +119,19 @@ const PAGE = `<!doctype html>
   /* Guarded so an explicit light choice still wins over the system preference. */
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --page: #0a0b0d;
-    --surface: #121418;
-    --surface-2: #171a1f;
-    --surface-3: #1e222a;
-    --ink: #e6e9ee;
-    --ink-2: #a0a7b4;
-    --muted: #6b7280;
-    --line: #23272e;
-    --line-2: #2f343c;
-    --accent: #9085e9;
-    --accent-2: #a79ef0;
-    --accent-wash: #1b1a33;
+    --page: #131210;
+    --surface: #1c1a15;
+    --surface-2: #24201a;
+    --surface-3: #2d2820;
+    --ink: #f1eee5;
+    --ink-2: #c0b9aa;
+    --muted: #8a8477;
+    --line: #332e23;
+    --line-2: #423c2e;
+    --accent: #d9a441;
+    --accent-2: #e6b660;
+    --accent-wash: #2b2211;
+    --on-accent: #131210;
     --good-wash: #112a13;
     --warn-wash: #2b2410;
     --crit-wash: #2e1618;
@@ -131,18 +139,19 @@ const PAGE = `<!doctype html>
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --page: #0a0b0d;
-  --surface: #121418;
-  --surface-2: #171a1f;
-  --surface-3: #1e222a;
-  --ink: #e6e9ee;
-  --ink-2: #a0a7b4;
-  --muted: #6b7280;
-  --line: #23272e;
-  --line-2: #2f343c;
-  --accent: #9085e9;
-  --accent-2: #a79ef0;
-  --accent-wash: #1b1a33;
+  --page: #131210;
+  --surface: #1c1a15;
+  --surface-2: #24201a;
+  --surface-3: #2d2820;
+  --ink: #f1eee5;
+  --ink-2: #c0b9aa;
+  --muted: #8a8477;
+  --line: #332e23;
+  --line-2: #423c2e;
+  --accent: #d9a441;
+  --accent-2: #e6b660;
+  --accent-wash: #2b2211;
+  --on-accent: #131210;
   --good-wash: #112a13;
   --warn-wash: #2b2410;
   --crit-wash: #2e1618;
@@ -177,7 +186,7 @@ svg { display: block; flex: none; }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .mark {
   width: 24px; height: 24px; border-radius: var(--r-xs); flex: none;
-  background: var(--accent); color: #fff; display: grid; place-items: center;
+  background: var(--accent); color: var(--on-accent); display: grid; place-items: center;
 }
 .mark svg { width: 14px; height: 14px; }
 .brand h1 { font-size: 13.5px; font-weight: 660; margin: 0; letter-spacing: -.01em; white-space: nowrap; }
@@ -213,7 +222,7 @@ svg { display: block; flex: none; }
 .btn:hover { background: var(--surface-2); }
 .btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-wash), 0 0 0 1px var(--accent); }
 .btn svg { width: 14px; height: 14px; }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn-primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
 .btn-ghost { border-color: transparent; background: transparent; color: var(--ink-2); }
 .btn-ghost:hover { background: var(--surface-2); color: var(--ink); }
@@ -332,7 +341,7 @@ main { padding: 18px 0 56px; display: grid; grid-template-columns: minmax(0, 1fr
   font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums;
   color: var(--ink-2); background: var(--surface); border: 1px solid var(--line-2);
 }
-.rank.pin { color: #fff; background: var(--accent); border-color: var(--accent); }
+.rank.pin { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
 .r-main { min-width: 0; }
 .r-id { font-size: 12px; font-weight: 500; color: var(--ink); display: flex; align-items: center; gap: 7px; min-width: 0; }
 .r-id .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
