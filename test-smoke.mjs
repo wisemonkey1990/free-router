@@ -1630,6 +1630,98 @@ try {
     false,
   );
 
+  // Adding a provider registers it in config.json and, given a key, the env
+  // file, and it applies without a restart.
+  const addProvider = await fetch(`${base}/api/providers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({
+      action: 'add',
+      name: 'groq',
+      baseUrl: 'https://api.groq.example/v1',
+      freeModels: ['llama-3.3-70b'],
+      key: 'groq-added-key',
+    }),
+  });
+  assert.equal(addProvider.status, 200);
+  const configOnDisk = JSON.parse(fs.readFileSync(testConfig, 'utf8'));
+  assert.ok(configOnDisk.providers.groq, 'provider written to config.json');
+  assert.deepEqual(configOnDisk.providers.groq.freeModels, ['llama-3.3-70b']);
+  const withGroq = await fetch(`${base}/api/state`).then((res) => res.json());
+  const groqRow = withGroq.providers.find((entry) => entry.name === 'groq');
+  assert.equal(groqRow.configured, true);
+  assert.equal(groqRow.removable, true);
+  // A bad base URL is rejected, and a duplicate name is rejected.
+  assert.equal(
+    (await fetch(`${base}/api/providers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', name: 'evil', baseUrl: 'file:///etc/passwd' }),
+    })).status,
+    400,
+  );
+  assert.equal(
+    (await fetch(`${base}/api/providers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', name: 'groq', baseUrl: 'https://x.example/v1' }),
+    })).status,
+    400,
+  );
+  // The default and discovery providers cannot be deleted from the UI.
+  assert.equal(
+    (await fetch(`${base}/api/providers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', name: 'openrouter' }),
+    })).status,
+    400,
+  );
+
+  // Reordering and deleting route entries rewrites config.routes and takes
+  // effect immediately.
+  const routeReorder = await fetch(`${base}/api/routes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      route: 'test-route',
+      entries: [
+        { provider: 'bai', model: 'glm-5.3-flash' },
+        { provider: 'gemini', model: 'gemini-3.8-flash' },
+      ],
+    }),
+  });
+  assert.equal(routeReorder.status, 200);
+  const afterRoute = JSON.parse(fs.readFileSync(testConfig, 'utf8'));
+  assert.deepEqual(
+    afterRoute.routes['test-route'].map((entry) => entry.provider + ':' + entry.model),
+    ['bai:glm-5.3-flash', 'gemini:gemini-3.8-flash'],
+  );
+  const routeState = await fetch(`${base}/api/state`).then((res) => res.json());
+  assert.deepEqual(
+    routeState.configuredRoute.map((entry) => entry.provider + ':' + entry.model),
+    ['bai:glm-5.3-flash', 'gemini:gemini-3.8-flash'],
+  );
+  // An entry naming an unknown provider is rejected.
+  assert.equal(
+    (await fetch(`${base}/api/routes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route: 'test-route', entries: [{ provider: 'ghost', model: 'x' }] }),
+    })).status,
+    400,
+  );
+
+  // Deleting a provider removes it from config and from every route.
+  const delGroq = await fetch(`${base}/api/providers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'delete', name: 'groq' }),
+  });
+  assert.equal(delGroq.status, 200);
+  const afterDelete = JSON.parse(fs.readFileSync(testConfig, 'utf8'));
+  assert.equal(afterDelete.providers.groq, undefined);
+
   console.log(
     'smoke test passed: pluggable providers, ranking, fallback, discovery, usage counters, and tracking work',
   );

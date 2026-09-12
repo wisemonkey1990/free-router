@@ -111,8 +111,9 @@ export function createProviderRegistry(config, { host, port }) {
   const entries = Object.entries(config.providers || {});
   if (!entries.length) throw new Error('config.providers is empty');
 
-  const providers = new Map();
-  for (const [name, raw] of entries) {
+  // Builds one provider object from its config block. Shared by the initial
+  // load and by addProvider so a runtime-added provider is identical in shape.
+  function buildProvider(name, raw) {
     if (!PROVIDER_ID.test(name)) {
       throw new Error(`invalid provider id "${name}"; use lowercase letters, digits, _ or -`);
     }
@@ -127,7 +128,7 @@ export function createProviderRegistry(config, { host, port }) {
     const catalogHasPricing = usesCatalog && cfg.pricing !== false;
     const baseUrl = String(process.env[baseUrlEnv] || cfg.baseUrl || '').replace(/\/+$/, '');
     if (!baseUrl) throw new Error(`provider ${name} is missing baseUrl`);
-    providers.set(name, {
+    return {
       name,
       keyEnv,
       baseUrlEnv,
@@ -155,7 +156,12 @@ export function createProviderRegistry(config, { host, port }) {
       catalogFetchedAt: 0,
       catalogAttemptedAt: 0,
       catalogError: '',
-    });
+    };
+  }
+
+  const providers = new Map();
+  for (const [name, raw] of entries) {
+    providers.set(name, buildProvider(name, raw));
   }
 
   const configuredDefault = config.defaultProvider;
@@ -502,6 +508,36 @@ export function createProviderRegistry(config, { host, port }) {
     return true;
   }
 
+  function hasProvider(name) {
+    return providers.has(name);
+  }
+
+  // Registers a provider from a config block at runtime. Throws on a bad id,
+  // a duplicate name, or a missing baseUrl, so the caller can report why.
+  function addProvider(name, raw) {
+    if (providers.has(name)) throw new Error(`provider ${name} already exists`);
+    const provider = buildProvider(name, raw);
+    providers.set(name, provider);
+    offeringsGeneration += 1;
+    return provider;
+  }
+
+  // Removes a provider at runtime. The default and discovery providers are the
+  // registry's backbone, so refuse to remove them here; that stays a config
+  // edit. Returns { ok } or { ok:false, error }.
+  function removeProvider(name) {
+    if (!providers.has(name)) return { ok: false, error: `unknown provider: ${name}` };
+    if (name === defaultProvider) {
+      return { ok: false, error: `${name} is the default provider; change defaultProvider first` };
+    }
+    if (name === discoveryProvider) {
+      return { ok: false, error: `${name} is the discovery provider; change discovery.provider first` };
+    }
+    providers.delete(name);
+    offeringsGeneration += 1;
+    return { ok: true };
+  }
+
   return {
     providers,
     defaultProvider,
@@ -522,6 +558,9 @@ export function createProviderRegistry(config, { host, port }) {
     unavailableFreeModels,
     providerKind,
     setApiKey,
+    hasProvider,
+    addProvider,
+    removeProvider,
     chatUrl(name) {
       const provider = get(name);
       return provider ? joinUrl(provider.baseUrl, provider.chatPath) : '';

@@ -239,6 +239,31 @@ section { background: var(--card); border: 1px solid var(--line); border-radius:
 .prov-hint { margin-top: 7px; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .prov-actions { display: flex; gap: 8px; align-items: center; padding-top: 3px; }
 
+.sec-head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.addform {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--card-2);
+  padding: 16px; margin-bottom: 8px; display: grid; gap: 12px;
+}
+.addgrid { display: grid; grid-template-columns: 1fr 1.4fr 1.2fr; gap: 12px; }
+.addform label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); font-weight: 550; }
+.addform input[type="text"], .addform input:not([type]), .addform input[type="password"] {
+  padding: 8px 11px; border-radius: 8px; border: 1px solid var(--input-line);
+  background: var(--input-bg); color: var(--text); font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.addform input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); }
+.addrow { display: flex; gap: 18px; align-items: end; flex-wrap: wrap; }
+.addform label.chk { flex-direction: row; align-items: center; gap: 7px; font-family: inherit; padding-bottom: 8px; }
+.addform label.grow { flex: 1; min-width: 220px; }
+.addactions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.addactions .prov-hint { margin-top: 0; }
+
+.rowbtns { display: inline-flex; gap: 4px; align-items: center; }
+.rowbtns button { padding: 3px 8px; font-size: 13px; line-height: 1; border-radius: 6px; }
+.rowbtns button.del:hover { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.rowbtns button:disabled { opacity: .3; }
+td.auto { color: var(--faint); font-size: 12px; }
+
 button {
   padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 550;
   border: 1px solid var(--input-line); background: var(--btn-bg); color: var(--text); cursor: pointer;
@@ -308,6 +333,7 @@ tbody tr:hover { background: var(--card-2); }
   .prov-name { padding-top: 0; }
   main, header { padding-left: 18px; padding-right: 18px; }
   .head-right { width: 100%; }
+  .addgrid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -332,11 +358,33 @@ tbody tr:hover { background: var(--card-2); }
   <div class="tiles" id="tiles" aria-label="Today's traffic"></div>
 
   <section>
-    <div class="sec-head">
-      <h2>Provider keys</h2>
-      <p id="keys-blurb"></p>
+    <div class="sec-head sec-head-row">
+      <div>
+        <h2>Provider keys</h2>
+        <p id="keys-blurb"></p>
+      </div>
+      <button class="icon" id="add-provider-toggle">+ Add provider</button>
     </div>
-    <div class="sec-body"><div id="providers"><div class="skeleton">Loading providers&hellip;</div></div></div>
+    <div class="sec-body">
+      <form id="add-provider" class="addform" hidden autocomplete="off">
+        <div class="addgrid">
+          <label>Name<input id="ap-name" placeholder="e.g. groq" spellcheck="false"></label>
+          <label>Base URL<input id="ap-url" placeholder="https://api.example.com/v1" spellcheck="false"></label>
+          <label>API key (optional)<input id="ap-key" type="password" placeholder="Paste key" spellcheck="false"></label>
+        </div>
+        <div class="addrow">
+          <label class="chk"><input type="checkbox" id="ap-catalog"> Has a /models catalog</label>
+          <label class="chk" id="ap-pricing-wrap" hidden><input type="checkbox" id="ap-pricing" checked> Catalog publishes prices</label>
+          <label class="grow" id="ap-free-wrap">Free models (comma-separated)<input id="ap-free" placeholder="model-a, org/model-b" spellcheck="false"></label>
+        </div>
+        <div class="addactions">
+          <button type="submit" class="primary" id="ap-submit">Add provider</button>
+          <button type="button" class="quiet" id="ap-cancel">Cancel</button>
+          <span class="prov-hint" id="ap-hint">Writes a new block to config.json and, if given, the key to the env file.</span>
+        </div>
+      </form>
+      <div id="providers"><div class="skeleton">Loading providers&hellip;</div></div>
+    </div>
   </section>
 
   <section>
@@ -585,29 +633,55 @@ function renderProviders() {
     field.addEventListener('keydown', (event) => { if (event.key === 'Enter') submit(); });
 
     if (provider.configured) {
-      const remove = document.createElement('button');
-      remove.className = 'quiet';
-      remove.textContent = 'Remove';
-      remove.title = 'Delete ' + provider.keyEnv + ' from ' + state.envFile;
-      remove.onclick = async () => {
-        const message = 'Remove ' + provider.keyEnv + '?\\n\\n'
+      const clear = document.createElement('button');
+      clear.className = 'quiet';
+      clear.textContent = 'Clear key';
+      clear.title = 'Delete ' + provider.keyEnv + ' from ' + state.envFile;
+      clear.onclick = async () => {
+        const message = 'Clear ' + provider.keyEnv + '?\\n\\n'
           + 'It is deleted from ' + state.envFile + ' and unset in the running process, '
-          + 'so ' + provider.name + ' stops being used.';
+          + 'so ' + provider.name + ' stops being used. The provider stays configured.';
         if (!confirm(message)) return;
-        remove.disabled = true;
+        clear.disabled = true;
         try {
           await api('api/keys', {
             method: 'POST',
             body: JSON.stringify({ provider: provider.name, key: '' }),
           });
-          toast('Removed ' + provider.keyEnv + '.', 'good');
+          toast('Cleared ' + provider.keyEnv + '.', 'good');
           await load();
         } catch (error) {
           toast(String(error.message || error), 'err');
-          remove.disabled = false;
+          clear.disabled = false;
         }
       };
-      actions.appendChild(remove);
+      actions.appendChild(clear);
+    }
+
+    if (provider.removable) {
+      const del = document.createElement('button');
+      del.className = 'quiet';
+      del.textContent = 'Delete';
+      del.title = 'Remove the ' + provider.name + ' provider from config.json entirely';
+      del.onclick = async () => {
+        const message = 'Delete provider ' + provider.name + '?\\n\\n'
+          + 'It is removed from config.json, its key is cleared, and its models are '
+          + 'dropped from every route. This cannot be undone from here.';
+        if (!confirm(message)) return;
+        del.disabled = true;
+        try {
+          await api('api/providers', {
+            method: 'POST',
+            body: JSON.stringify({ action: 'delete', name: provider.name }),
+          });
+          toast('Deleted provider ' + provider.name + '.', 'good');
+          await load();
+        } catch (error) {
+          toast(String(error.message || error), 'err');
+          del.disabled = false;
+        }
+      };
+      actions.appendChild(del);
     }
 
     row.appendChild(name);
@@ -616,58 +690,128 @@ function renderProviders() {
     host.appendChild(row);
   }
   el('keys-blurb').textContent =
-    'Saving writes the key to ' + state.envFile + ' with 0600 permissions and applies it to the '
-    + 'running gateway right away, so there is no restart. Only these provider variables can be written.';
+    'Saving writes the key to ' + state.envFile + ' with 0600 permissions and applies it right away, '
+    + 'no restart. Add a provider to register a new OpenAI-compatible endpoint in config.json, or '
+    + 'Delete one to remove it entirely. The default and discovery providers cannot be deleted here.';
+}
+
+function saveRoute(entries) {
+  return api('api/routes', {
+    method: 'POST',
+    body: JSON.stringify({ route: state.route, entries }),
+  });
+}
+
+async function applyRouteOrder(entries, okMessage) {
+  try {
+    await saveRoute(entries);
+    toast(okMessage, 'good');
+    await load();
+  } catch (error) {
+    toast(String(error.message || error), 'err');
+  }
 }
 
 function renderRoutes() {
   const host = el('routes');
   host.textContent = '';
+  const configured = state.configuredRoute || [];
   el('routes-blurb').textContent =
-    'Order the gateway tries models in. It stops at the first one that returns usable content. '
-    + 'used and left are today (' + state.usage.today + ' ' + state.usage.timezone
-    + '); rate limits and 404s are excluded, because the provider rejected those before running the model.';
-  const rows = state.routes.map((entry) => {
-    let status = 'ready';
-    let kind = 'ok';
-    if (!entry.providerConfigured) { status = 'no key'; kind = 'no'; }
-    else if (entry.zeroCost === false) { status = 'paid'; kind = 'bad'; }
-    else if (entry.cooldownSeconds > 0) { status = 'cooldown ' + entry.cooldownSeconds + 's'; kind = 'warn'; }
-    const usage = entry.usage || null;
-    const used = usage ? usage.today.consumed : 0;
-    const limit = usage ? usage.dailyLimit : null;
-    const remaining = usage ? usage.remainingToday : null;
-    const model = document.createElement('span');
-    if (entry.pinned) {
-      const star = document.createElement('span');
-      star.className = 'pinstar';
-      star.textContent = '\u2605 ';
-      star.title = 'pinned: always tried first';
-      model.appendChild(star);
-    }
-    model.appendChild(document.createTextNode(entry.model));
-    let left = '\u2013';
-    if (limit != null) left = remaining + ' / ' + limit;
-    return [
-      td(String(entry.priority), 'num'),
-      td(pill(status, kind)),
-      td(entry.provider, 'muted'),
-      td(model, 'mono'),
-      td(used || '\u2013', 'num'),
-      td(left, 'num'),
-    ];
-  });
-  host.appendChild(table(
-    [
-      { label: '#', num: true },
-      { label: 'status' },
-      { label: 'provider' },
-      { label: 'model' },
-      { label: 'used', num: true },
-      { label: 'left today', num: true },
-    ],
-    rows,
-  ));
+    'The models this route tries, in your configured order. Use the arrows to set priority and '
+    + '\u00d7 to remove one; changes are written to config.json. used and left are today ('
+    + state.usage.today + ' ' + state.usage.timezone + '). Pinned models and observed reliability '
+    + 'can still re-rank the effective order, and discovered models are added automatically.';
+
+  if (!configured.length) {
+    const empty = document.createElement('p');
+    empty.className = 'note';
+    empty.textContent = 'No models configured for this route. Any discovered free models are listed below.';
+    host.appendChild(empty);
+  } else {
+    const keys = () => configured.map((e) => ({ provider: e.provider, model: e.model }));
+    const rows = configured.map((entry, index) => {
+      let status = 'ready';
+      let kind = 'ok';
+      if (!entry.providerKnown) { status = 'no provider'; kind = 'bad'; }
+      else if (!entry.providerConfigured) { status = 'no key'; kind = 'no'; }
+      else if (entry.zeroCost === false) { status = 'paid'; kind = 'bad'; }
+      else if (entry.cooldownSeconds > 0) { status = 'cooldown ' + entry.cooldownSeconds + 's'; kind = 'warn'; }
+      const usage = entry.usage || null;
+      const used = usage ? usage.today.consumed : 0;
+      const limit = usage ? usage.dailyLimit : null;
+      const remaining = usage ? usage.remainingToday : null;
+      const model = document.createElement('span');
+      if (entry.pinned) {
+        const star = document.createElement('span');
+        star.className = 'pinstar';
+        star.textContent = '\u2605 ';
+        star.title = 'pinned: always tried first';
+        model.appendChild(star);
+      }
+      model.appendChild(document.createTextNode(entry.model));
+      let left = '\u2013';
+      if (limit != null) left = remaining + ' / ' + limit;
+
+      const ctrls = document.createElement('span');
+      ctrls.className = 'rowbtns';
+      const up = document.createElement('button');
+      up.textContent = '\u2191'; up.title = 'Move up'; up.setAttribute('aria-label', 'Move up'); up.disabled = index === 0;
+      const down = document.createElement('button');
+      down.textContent = '\u2193'; down.title = 'Move down'; down.setAttribute('aria-label', 'Move down'); down.disabled = index === configured.length - 1;
+      const del = document.createElement('button');
+      del.className = 'del'; del.textContent = '\u00d7'; del.title = 'Remove from route'; del.setAttribute('aria-label', 'Remove from route');
+      up.onclick = () => {
+        const e = keys();
+        const t = e[index - 1]; e[index - 1] = e[index]; e[index] = t;
+        applyRouteOrder(e, 'Moved ' + entry.model + ' up.');
+      };
+      down.onclick = () => {
+        const e = keys();
+        const t = e[index + 1]; e[index + 1] = e[index]; e[index] = t;
+        applyRouteOrder(e, 'Moved ' + entry.model + ' down.');
+      };
+      del.onclick = () => {
+        if (!confirm('Remove ' + entry.provider + ':' + entry.model + ' from the route?')) return;
+        applyRouteOrder(keys().filter((_, i) => i !== index), 'Removed ' + entry.model + ' from the route.');
+      };
+      ctrls.appendChild(up); ctrls.appendChild(down); ctrls.appendChild(del);
+
+      return [
+        td(String(entry.order), 'num'),
+        td(pill(status, kind)),
+        td(entry.provider, 'muted'),
+        td(model, 'mono'),
+        td(used || '\u2013', 'num'),
+        td(left, 'num'),
+        td(ctrls, 'num'),
+      ];
+    });
+    host.appendChild(table(
+      [
+        { label: '#', num: true },
+        { label: 'status' },
+        { label: 'provider' },
+        { label: 'model' },
+        { label: 'used', num: true },
+        { label: 'left today', num: true },
+        { label: '' },
+      ],
+      rows,
+    ));
+  }
+
+  const discovered = (state.routes || []).filter((entry) => !entry.configured);
+  if (discovered.length) {
+    const line = document.createElement('p');
+    line.className = 'note';
+    line.appendChild(pill('auto', 'no'));
+    line.appendChild(document.createTextNode(' Discovered and ranked automatically (not editable here): '));
+    const ids = document.createElement('span');
+    ids.className = 'mono';
+    ids.textContent = discovered.map((entry) => entry.provider + ':' + entry.model).join(', ');
+    line.appendChild(ids);
+    host.appendChild(line);
+  }
 
   if (state.unavailableModels && state.unavailableModels.length) {
     const gone = document.createElement('p');
@@ -792,11 +936,47 @@ el('copy').onclick = async () => {
 el('refresh').onclick = () => refresh(false);
 el('theme').onclick = toggleTheme;
 
+// Add-provider form.
+const apForm = el('add-provider');
+el('add-provider-toggle').onclick = () => {
+  apForm.hidden = !apForm.hidden;
+  if (!apForm.hidden) el('ap-name').focus();
+};
+el('ap-cancel').onclick = () => { apForm.hidden = true; apForm.reset(); el('ap-pricing-wrap').hidden = true; };
+el('ap-catalog').onchange = () => { el('ap-pricing-wrap').hidden = !el('ap-catalog').checked; };
+apForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const name = el('ap-name').value.trim();
+  const baseUrl = el('ap-url').value.trim();
+  const key = el('ap-key').value.trim();
+  const catalog = el('ap-catalog').checked;
+  const pricing = el('ap-pricing').checked;
+  const freeModels = el('ap-free').value.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!name) { toast('Give the provider a name.', 'err'); return; }
+  if (!baseUrl) { toast('Base URL is required.', 'err'); return; }
+  const submitBtn = el('ap-submit');
+  submitBtn.disabled = true;
+  try {
+    await api('api/providers', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'add', name, baseUrl, catalog, pricing, freeModels, key }),
+    });
+    toast('Added provider ' + name + '.', 'good');
+    apForm.reset();
+    apForm.hidden = true;
+    el('ap-pricing-wrap').hidden = true;
+    await load();
+  } catch (error) {
+    toast(String(error.message || error), 'err');
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+
 // A gentle "updated Ns ago" ticker so a stale page is obvious.
 setInterval(() => {
   if (!lastLoadedAt) return;
   const secs = Math.round((Date.now() - lastLoadedAt) / 1000);
-  const sel = el('updated').dataset;
   const ago = secs < 5 ? 'updated just now' : 'updated ' + secs + 's ago';
   const base = state && state.lastSelection && state.lastSelection.provider
     ? 'last served ' + state.lastSelection.provider + ':' + state.lastSelection.model + '  \u00b7  '

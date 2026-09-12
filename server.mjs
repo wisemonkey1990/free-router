@@ -1879,12 +1879,21 @@ function uiProviderState() {
     catalogModels: provider.usesCatalog ? provider.catalog.size : null,
     catalogError: catalogHealth[provider.name]?.catalogError || null,
     unavailableModels: catalogHealth[provider.name]?.unavailableModels || [],
+    // The default and discovery providers are the registry's backbone and can
+    // only be removed by editing config.json, so the UI hides Delete for them.
+    removable: provider.name !== registry.defaultProvider
+      && provider.name !== registry.discoveryProvider,
   }));
 }
 
 function uiRouteState() {
   const routes = routeStatus();
   const entries = routes[DISCOVERY_ROUTE] || Object.values(routes)[0] || [];
+  // Only entries written in config.json can be reordered or deleted from the
+  // UI; discovered models are auto-managed and rank on their own score.
+  const configuredKeys = new Set(
+    (config.routes?.[DISCOVERY_ROUTE] || []).map(normalizeCandidate).map(candidateKey),
+  );
   return entries.map((entry) => ({
     priority: entry.priority,
     provider: entry.provider,
@@ -1894,8 +1903,248 @@ function uiRouteState() {
     cooldownSeconds: entry.cooldownSeconds,
     scoreAdjustment: entry.scoreAdjustment,
     providerConfigured: Boolean(PROVIDERS.get(entry.provider)?.apiKey),
+    configured: configuredKeys.has(`${entry.provider}:${entry.id}`),
     usage: entry.usage,
   }));
+}
+
+// Atomically rewrite config.json after a UI-driven change to providers or
+// routes. config.json is plain JSON (no comments), so a full re-serialize is
+// lossless. Written 0644: it holds no secrets, only structure; keys live in
+// the 0600 env file.
+function persistConfig() {
+  const temporaryPath = `${CONFIG_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o644 });
+  fs.renameSync(temporaryPath, CONFIG_PATH);
+}
+
+function isValidBaseUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+const PROVIDER_ID_RE = /^[a-z][a-z0-9_-]*$/;
+
+// The configured route in its raw config.json order, including entries whose
+// provider has no key yet. This is the editable source of truth the UI reorders
+// and deletes against; the scored `routes` list drops keyless entries and
+// re-ranks, so it cannot drive a stable priority editor.
+function uiConfiguredRoute() {
+  const now = Date.now();
+  const configured = (config.routes?.[DISCOVERY_ROUTE] || [])
+    .map(normalizeCandidate)
+    .filter((candidate) => candidate.model);
+  return configured.map((candidate, index) => {
+    const key = candidateKey(candidate);
+    const provider = PROVIDERS.get(candidate.provider);
+    const cooldown = cooldowns.get(key);
+    const model = candidateMetadata(candidate);
+    return {
+      order: index + 1,
+      provider: candidate.provider,
+      model: candidate.model,
+      pinned: PINNED_MODELS.has(key) || PINNED_MODELS.has(candidate.model),
+      providerKnown: Boolean(provider),
+      providerConfigured: Boolean(provider?.apiKey),
+      zeroCost: provider?.catalogHasPricing ? (model ? isZeroCost(model) : null) : true,
+      cooldownSeconds: cooldown && cooldown.until > now ? Math.ceil((cooldown.until - now) / 1000) : 0,
+      usage: usageForKey(key),
+    };
+  });
+}
+
+async function handleProviderMutation(req, res) {
+  let body;
+  try {
+    body = await readJson(req, 64 * 1024);
+  } catch (error) {
+    return sendJson(res, 400, {
+      error: { message: String(error), type: 'invalid_request_error' },
+    });
+  }
+
+  const action = String(body.action || 'add');
+  const name = String(body.name || '').trim();
+  if (!PROVIDER_ID_RE.test(name)) {
+    return sendJson(res, 400, {
+      error: {
+        message: 'provider id must be lowercase letters, digits, _ or - and start with a letter',
+        type: 'invalid_request_error',
+      },
+    });
+  }
+
+  if (action === 'delete') {
+    const provider = PROVIDERS.get(name);
+    if (!provider) {
+      return sendJson(res, 400, {
+        error: { message: `unknown provider: ${name}`, type: 'invalid_request_error' },
+      });
+    }
+    const result = registry.removeProvider(name);
+    if (!result.ok) {
+      return sendJson(res, 400, { error: { message: result.error, type: 'invalid_request_error' } });
+    }
+    delete config.providers[name];
+    // Drop any route entries that pointed at the now-gone provider.
+    for (const route of Object.keys(config.routes || {})) {
+      config.routes[route] = (config.routes[route] || [])
+        .map(normalizeCandidate)
+        .filter((candidate) => candidate.provider !== name)
+        .map((candidate) => ({ provider: candidate.provider, model: candidate.model }));
+    }
+    try {
+      updateEnvFile(UI_ENV_PATH, { [provider.keyEnv]: '' });
+    } catch (error) {
+      log(`failed to clear ${provider.keyEnv} while deleting ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    refreshSecretRedactor();
+    try {
+      persistConfig();
+    } catch (error) {
+      return sendJson(res, 500, {
+        error: { message: `could not write config: ${error instanceof Error ? error.message : String(error)}`, type: 'config_write_failed' },
+      });
+    }
+    log(`removed provider ${name} via web interface`);
+    return sendJson(res, 200, { ok: true, provider: name, removed: true });
+  }
+
+  if (action !== 'add') {
+    return sendJson(res, 400, {
+      error: { message: `unknown action: ${action}`, type: 'invalid_request_error' },
+    });
+  }
+
+  if (registry.hasProvider(name) || (config.providers && config.providers[name])) {
+    return sendJson(res, 400, {
+      error: { message: `provider ${name} already exists`, type: 'invalid_request_error' },
+    });
+  }
+  const baseUrl = String(body.baseUrl || '').trim();
+  if (!isValidBaseUrl(baseUrl)) {
+    return sendJson(res, 400, {
+      error: { message: 'baseUrl must be a valid http(s) URL', type: 'invalid_request_error' },
+    });
+  }
+  const catalog = body.catalog === true;
+  const freeModels = Array.isArray(body.freeModels)
+    ? body.freeModels.map((id) => String(id).trim()).filter(Boolean)
+    : [];
+  const cfg = { baseUrl };
+  if (catalog) {
+    cfg.catalog = true;
+    cfg.pricing = body.pricing !== false;
+  }
+  if (freeModels.length) cfg.freeModels = freeModels;
+
+  try {
+    registry.addProvider(name, cfg);
+  } catch (error) {
+    return sendJson(res, 400, {
+      error: { message: error instanceof Error ? error.message : String(error), type: 'invalid_request_error' },
+    });
+  }
+  config.providers[name] = cfg;
+
+  const key = typeof body.key === 'string' ? body.key.trim() : '';
+  if (key) {
+    const problem = validateSecret(key);
+    if (problem) {
+      // Roll back the half-added provider so a bad key does not leave a stub.
+      registry.removeProvider(name);
+      delete config.providers[name];
+      return sendJson(res, 400, { error: { message: problem, type: 'invalid_request_error' } });
+    }
+    const provider = PROVIDERS.get(name);
+    try {
+      updateEnvFile(UI_ENV_PATH, { [provider.keyEnv]: key });
+    } catch (error) {
+      registry.removeProvider(name);
+      delete config.providers[name];
+      return sendJson(res, 500, {
+        error: { message: `could not write env file: ${error instanceof Error ? error.message : String(error)}`, type: 'env_write_failed' },
+      });
+    }
+    registry.setApiKey(name, key);
+    refreshSecretRedactor();
+  }
+
+  try {
+    persistConfig();
+  } catch (error) {
+    return sendJson(res, 500, {
+      error: { message: `could not write config: ${error instanceof Error ? error.message : String(error)}`, type: 'config_write_failed' },
+    });
+  }
+  log(`added provider ${name} via web interface`);
+  if (key && catalog) {
+    try {
+      await refreshCatalog(true);
+    } catch (error) {
+      log(`catalog refresh after adding ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return sendJson(res, 200, { ok: true, provider: name, configured: Boolean(key) });
+}
+
+async function handleRouteUpdate(req, res) {
+  let body;
+  try {
+    body = await readJson(req, 256 * 1024);
+  } catch (error) {
+    return sendJson(res, 400, {
+      error: { message: String(error), type: 'invalid_request_error' },
+    });
+  }
+
+  const route = String(body.route || DISCOVERY_ROUTE);
+  if (!config.routes || !Array.isArray(config.routes[route])) {
+    return sendJson(res, 400, {
+      error: { message: `unknown route: ${route}`, type: 'invalid_request_error' },
+    });
+  }
+  if (!Array.isArray(body.entries)) {
+    return sendJson(res, 400, {
+      error: { message: 'entries must be an array of { provider, model }', type: 'invalid_request_error' },
+    });
+  }
+
+  const seen = new Set();
+  const entries = [];
+  for (const raw of body.entries) {
+    const provider = String(raw?.provider || '').trim();
+    const model = String(raw?.model || '').trim();
+    if (!provider || !model) {
+      return sendJson(res, 400, {
+        error: { message: 'each entry needs a provider and a model', type: 'invalid_request_error' },
+      });
+    }
+    if (!registry.hasProvider(provider)) {
+      return sendJson(res, 400, {
+        error: { message: `unknown provider in route: ${provider}`, type: 'invalid_request_error' },
+      });
+    }
+    const key = `${provider}:${model}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push({ provider, model });
+  }
+
+  config.routes[route] = entries;
+  try {
+    persistConfig();
+  } catch (error) {
+    return sendJson(res, 500, {
+      error: { message: `could not write config: ${error instanceof Error ? error.message : String(error)}`, type: 'config_write_failed' },
+    });
+  }
+  log(`updated route ${route} via web interface: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`);
+  return sendJson(res, 200, { ok: true, route, count: entries.length });
 }
 
 async function handleKeyUpdate(req, res) {
@@ -1993,6 +2242,7 @@ async function handler(req, res) {
         providers: uiProviderState(),
         usage: usageSummary(),
         routes: uiRouteState(),
+        configuredRoute: uiConfiguredRoute(),
         unavailableModels: discoveryUnavailableIds,
         excludedByProvider: rejectedConfiguredModels(),
         lastSelection,
@@ -2002,6 +2252,12 @@ async function handler(req, res) {
   }
   if (req.method === 'POST' && url.pathname === '/api/keys') {
     return handleKeyUpdate(req, res);
+  }
+  if (req.method === 'POST' && url.pathname === '/api/providers') {
+    return handleProviderMutation(req, res);
+  }
+  if (req.method === 'POST' && url.pathname === '/api/routes') {
+    return handleRouteUpdate(req, res);
   }
   // A cheap liveness probe for orchestrators. Unlike /health it computes no
   // ranking, usage summary, or catalog snapshot, so it is safe to poll often.
