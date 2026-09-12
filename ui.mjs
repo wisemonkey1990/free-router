@@ -80,28 +80,27 @@ const PAGE = `<!doctype html>
 <meta name="referrer" content="no-referrer">
 <title>Free Router</title>
 <style>
-/* Switchboard: warm graphite neutrals (not the cool blue-slate that reads as
-   a generic template) with a single muted amber signal color — the one lit
-   lamp on an old routing board — reserved for what's live: a pinned route,
-   a focused control, quota still on hand. Buttons and the brand mark are
-   flat fills, no gradients or glow. Hairline elevation (no card shadows),
-   6px radius, tight density, monospace-forward. */
+/* Signal: crisp true-neutral surfaces (no warm or blue cast to the gray
+   itself) with one vivid, confident blue — used flat, never gradiented or
+   glowing. Soft floating elevation on cards, a glass top bar, and a rounder
+   12/8/6px radius scale read current; the previous flat/hairline/6px pass
+   read as an old instrument panel instead. */
 :root {
   color-scheme: light;
-  --page: #f4f3f0;
+  --page: #fafafa;
   --surface: #ffffff;
-  --surface-2: #ece9e2;
-  --surface-3: #e0dbd1;
-  --ink: #1c1a16;
-  --ink-2: #57534a;
-  --muted: #8b8579;
-  --line: #e1ddd2;
-  --line-2: #c7c0b1;
-  --accent: #8a5a12;
-  --accent-2: #714a0e;
-  --accent-wash: #f6ecd8;
+  --surface-2: #f4f4f5;
+  --surface-3: #e9e9ec;
+  --ink: #0a0a0c;
+  --ink-2: #4b4b52;
+  --muted: #86868f;
+  --line: #e7e7ea;
+  --line-2: #d6d6db;
+  --accent: #2f5be0;
+  --accent-2: #2547b8;
+  --accent-wash: #eaf0fe;
   /* Light-mode accent is dark enough for white text; dark-mode accent is a
-     light amber, so its button text has to go the other way. */
+     lighter blue, so its button text has to go the other way. */
   --on-accent: #ffffff;
   /* Status hues are fixed in both modes: only the washes follow the mode. */
   --good: #0ca30c;
@@ -110,51 +109,57 @@ const PAGE = `<!doctype html>
   --warn-wash: #fbf0d9;
   --crit: #d03b3b;
   --crit-wash: #fae6e6;
-  --r: 6px;
-  --r-sm: 5px;
-  --r-xs: 4px;
-  --h: 32px;
+  --r: 12px;
+  --r-sm: 8px;
+  --r-xs: 6px;
+  --h: 34px;
+  --shadow-sm: 0 1px 2px rgba(10, 10, 15, .04);
+  --shadow: 0 1px 2px rgba(10, 10, 15, .04), 0 10px 28px -10px rgba(10, 10, 15, .12);
 }
 @media (prefers-color-scheme: dark) {
   /* Guarded so an explicit light choice still wins over the system preference. */
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --page: #131210;
-    --surface: #1c1a15;
-    --surface-2: #24201a;
-    --surface-3: #2d2820;
-    --ink: #f1eee5;
-    --ink-2: #c0b9aa;
-    --muted: #8a8477;
-    --line: #332e23;
-    --line-2: #423c2e;
-    --accent: #d9a441;
-    --accent-2: #e6b660;
-    --accent-wash: #2b2211;
-    --on-accent: #131210;
+    --page: #08090b;
+    --surface: #101114;
+    --surface-2: #17181c;
+    --surface-3: #202126;
+    --ink: #f5f5f7;
+    --ink-2: #b8b8c0;
+    --muted: #7d7d87;
+    --line: #232429;
+    --line-2: #2e3036;
+    --accent: #6690ff;
+    --accent-2: #85a5ff;
+    --accent-wash: #16233f;
+    --on-accent: #0a0a0c;
     --good-wash: #112a13;
     --warn-wash: #2b2410;
     --crit-wash: #2e1618;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, .5);
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 16px 36px -14px rgba(0, 0, 0, .7);
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --page: #131210;
-  --surface: #1c1a15;
-  --surface-2: #24201a;
-  --surface-3: #2d2820;
-  --ink: #f1eee5;
-  --ink-2: #c0b9aa;
-  --muted: #8a8477;
-  --line: #332e23;
-  --line-2: #423c2e;
-  --accent: #d9a441;
-  --accent-2: #e6b660;
-  --accent-wash: #2b2211;
-  --on-accent: #131210;
+  --page: #08090b;
+  --surface: #101114;
+  --surface-2: #17181c;
+  --surface-3: #202126;
+  --ink: #f5f5f7;
+  --ink-2: #b8b8c0;
+  --muted: #7d7d87;
+  --line: #232429;
+  --line-2: #2e3036;
+  --accent: #6690ff;
+  --accent-2: #85a5ff;
+  --accent-wash: #16233f;
+  --on-accent: #0a0a0c;
   --good-wash: #112a13;
   --warn-wash: #2b2410;
   --crit-wash: #2e1618;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .5);
+  --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 16px 36px -14px rgba(0, 0, 0, .7);
 }
 
 * { box-sizing: border-box; }
@@ -179,10 +184,12 @@ svg { display: block; flex: none; }
 /* Top bar ----------------------------------------------------------------- */
 .topbar {
   position: sticky; top: 0; z-index: 30;
-  background: var(--surface);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  backdrop-filter: saturate(1.6) blur(10px);
+  -webkit-backdrop-filter: saturate(1.6) blur(10px);
   border-bottom: 1px solid var(--line);
 }
-.topbar .wrap { display: flex; align-items: center; gap: 12px; height: 52px; }
+.topbar .wrap { display: flex; align-items: center; gap: 12px; height: 54px; }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .mark {
   width: 24px; height: 24px; border-radius: var(--r-xs); flex: none;
@@ -251,10 +258,9 @@ main { padding: 18px 0 56px; display: grid; grid-template-columns: minmax(0, 1fr
 .cols { display: grid; grid-template-columns: minmax(0, 1.32fr) minmax(0, 1fr); gap: 14px; align-items: start; }
 .cols > * { min-width: 0; }
 
-/* No shadows anywhere but the toast: elevation is a hairline and a plane. */
 .card {
   background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--r); min-width: 0;
+  border-radius: var(--r); min-width: 0; box-shadow: var(--shadow);
   display: flex; flex-direction: column; min-height: 0;
 }
 .card-head {
@@ -285,7 +291,7 @@ main { padding: 18px 0 56px; display: grid; grid-template-columns: minmax(0, 1fr
 .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .kpi {
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
-  padding: 13px 15px;
+  padding: 13px 15px; box-shadow: var(--shadow-sm);
   display: flex; flex-direction: column; gap: 1px; min-width: 0;
 }
 .kpi .lbl { font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
@@ -379,10 +385,9 @@ main { padding: 18px 0 56px; display: grid; grid-template-columns: minmax(0, 1fr
 .prov-id b { font-size: 12.5px; font-weight: 640; }
 .prov-id span { font-size: 10.5px; color: var(--muted); letter-spacing: .01em; }
 .prov-row { display: flex; gap: 6px; margin-top: 8px; }
-/* A recessed well, not a raised slab: the inset field is the instrument cue. */
 .field {
   flex: 1; min-width: 0; height: var(--h); padding: 0 10px; border-radius: var(--r-sm);
-  border: 1px solid var(--line-2); background: var(--surface-2); color: var(--ink);
+  border: 1px solid var(--line-2); background: var(--surface); color: var(--ink);
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
   transition: border-color .12s ease, box-shadow .12s ease;
 }
@@ -395,7 +400,7 @@ main { padding: 18px 0 56px; display: grid; grid-template-columns: minmax(0, 1fr
 
 /* Add provider form ------------------------------------------------------- */
 .addform {
-  border: 1px solid var(--line-2); border-radius: var(--r-sm); background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2);
   padding: 13px; margin-bottom: 13px; display: grid; gap: 11px;
 }
 .addform .fields { display: grid; gap: 9px; }
