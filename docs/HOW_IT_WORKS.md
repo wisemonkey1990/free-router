@@ -65,9 +65,15 @@ docker compose up -d
 
 The gateway is reachable at `http://127.0.0.1:8787/v1`, the same address as
 the non-Docker run. Keys are injected at runtime from `.env` and never baked
-into the image. Weekly-discovery state is ephemeral: it lives inside the
-container and is reset on rebuild (the gateway re-discovers free models on
-the weekly schedule).
+into the image. The container runs as the unprivileged `node` user. Weekly-
+discovery state is ephemeral by default: it lives inside the container and is
+reset on rebuild (the gateway re-discovers free models on the weekly schedule).
+
+To keep discovery results and usage counters across restarts — and avoid
+re-spending free-tier quota on discovery and evaluation each time — uncomment
+the `FREE_ROUTER_STATE_FILE` line and the two `volumes` blocks in
+`docker-compose.yml`. `FREE_ROUTER_STATE_FILE` points the state file at any
+path (the image pre-creates `/data` owned by `node` for a mounted volume).
 
 ```bash
 docker compose ps
@@ -197,13 +203,17 @@ The selected upstream is returned in `X-Free-Router-Provider` and
 GET  /                       web interface
 GET  /api/state              providers (masked keys), usage, route priority
 POST /api/keys               { "provider": "gemini", "key": "..." }
-GET  /health
+GET  /healthz                liveness only: { ok, service, version }
+GET  /health                 full status: providers, discovery, usage, routes
 GET  /v1/models
 POST /v1/chat/completions
 ```
 
 `GET /health` reports `version` from `package.json` (currently `1.0.0`). Releases are
-git tags of the form `v1.0.0`.
+git tags of the form `v1.0.0`. `GET /healthz` is a lightweight liveness probe
+(used by the Docker healthcheck and `start.sh`) that returns only `ok`,
+`service`, and `version`; unlike `/health` it does not compute the ranking,
+usage summary, or catalog snapshot, so it is safe to poll frequently.
 
 `GET /v1/models` returns the route alias, each static provider's `freeModels`,
 and every currently free text-chat model from catalog providers. A listed
@@ -225,6 +235,31 @@ Edit `config.json` to change ordering, timeout, and cooldowns. Pin entries with
 or that are no longer free, are skipped. IDs that differ only by org prefix or
 a `:free` suffix (for example `gemini-3.8-flash` and
 `google/gemini-3.8-flash:free`) count as the same model.
+
+A model whose provider has reported a per-day free-tier limit (see below) is
+also skipped once today's served count reaches it, since it would only answer
+with a 429. Hand-configured `usage.dailyLimits` never block a request — they
+are guesses (as documented under "Daily limits").
+
+### Timeouts and per-request budget
+
+| `config.json` key | Default | What it bounds |
+|---|---|---|
+| `connectTimeoutMs` | `min(attemptTimeoutMs, 60000)` | time to receive response headers from one upstream before failing over |
+| `attemptTimeoutMs` | `180000` | a whole non-streaming attempt, and reading the body |
+| `streamIdleTimeoutMs` | `attemptTimeoutMs` | the gap between chunks of a *committed* stream |
+| `requestBudgetMs` | `0` (off) | wall-clock across all fallback attempts for one client request |
+| `maxAttempts` | `0` (off) | number of upstreams tried for one client request |
+
+A streaming answer may legitimately run far longer than one attempt window, so
+once the first useful chunk commits the stream it is bounded by the idle gap
+between chunks (`streamIdleTimeoutMs`), not by total duration. If an upstream
+dies after committing — when the router can no longer fail over — the client
+stream is closed cleanly with an `error` event and the `[DONE]` sentinel rather
+than being silently truncated. `requestBudgetMs`/`maxAttempts` stop the router
+from walking a long fallback list after the client has likely given up; when
+either trips before any model answers the response is `504`
+`free_router_budget_exhausted`.
 
 ## Add a provider
 
@@ -311,6 +346,16 @@ was produced by an older benchmark version. Without this, a model whose single
 evaluation attempt hit a 429 would keep the fallback score of `-1` and stay
 last forever, because it was already tracked and so never looked like a new
 discovery again. At most `evaluation.maxPerRun` models are evaluated per run.
+
+Set `evaluation.samples` above `1` to ask each model the benchmark several
+times and keep the median score and latency, which smooths out a model that
+answers inconsistently — at the cost of one extra request per sample. The
+benchmark itself can be replaced with `evaluation.benchmark` (`prompt`,
+`parseBonus`, and an `items` array of `{ key, expected, weight }`); a numeric
+`expected` compares numerically, a string compares exactly. Overriding it is
+useful if the default public questions are suspected of having leaked into a
+model's training data. `evaluation.version` is bumped internally whenever the
+default benchmark changes so stored scores from an older scale are recomputed.
 
 Ranking also reacts to real traffic. Once a model has at least
 `evaluation.usageMinRequests` recorded attempts in the usage window, its

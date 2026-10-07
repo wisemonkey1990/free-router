@@ -48,3 +48,7 @@ More providers: add a block in `config.json`. See [How it works](docs/HOW_IT_WOR
   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=www222fff/free-router&type=Date" />
   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=www222fff/free-router&type=Date" />
 </picture>
+
+## License
+
+[MIT](LICENSE)

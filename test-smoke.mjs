@@ -546,6 +546,15 @@ const baiMock = http.createServer(async (req, res) => {
           choices: [{ delta: { content: 'bai-ok' }, finish_reason: null }],
         })}\n\n`,
       );
+      // Simulate an upstream that dies mid-stream after committing: drop the
+      // socket without sending [DONE]. The router can no longer fail over, so it
+      // must close the client stream cleanly with an error event and [DONE].
+      // Destroy on a later tick so the first chunk flushes and the router
+      // commits the stream before the connection resets.
+      if (body.messages?.some((message) => message.content === 'interrupt-stream')) {
+        setTimeout(() => res.socket?.destroy(), 50);
+        return;
+      }
       res.end('data: [DONE]\n\n');
       return;
     }
@@ -1072,6 +1081,17 @@ try {
   assert.match(stream, /bai-ok/);
   assert.doesNotMatch(stream, /thinking only/);
 
+  // A cheap liveness probe: ok/version only, and none of the heavy detail that
+  // /health computes, so orchestrators can poll it without running the ranking.
+  const livez = await fetch(`http://127.0.0.1:${routerPort}/healthz`);
+  assert.equal(livez.status, 200);
+  const livezBody = await livez.json();
+  assert.equal(livezBody.ok, true);
+  assert.equal(livezBody.version, PACKAGE_VERSION);
+  assert.equal(livezBody.routes, undefined);
+  assert.equal(livezBody.usage, undefined);
+  assert.equal(livezBody.discovery, undefined);
+
   const directTokenRouterResponse = await fetch(
     `http://127.0.0.1:${routerPort}/v1/chat/completions`,
     {
@@ -1453,6 +1473,31 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
+  // An upstream that dies after committing the stream cannot be failed over, so
+  // the router must terminate the client stream cleanly: the partial content it
+  // already sent, then an error event, then the [DONE] sentinel. Run after the
+  // usage-count assertions above, since this adds one more served bai request.
+  const interruptResponse = await fetch(
+    `http://127.0.0.1:${routerPort}/v1/chat/completions`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'test-route',
+        stream: true,
+        messages: [
+          { role: 'user', content: 'force-token-failure' },
+          { role: 'user', content: 'interrupt-stream' },
+        ],
+      }),
+    },
+  );
+  assert.equal(interruptResponse.status, 200);
+  const interruptStream = await interruptResponse.text();
+  assert.match(interruptStream, /bai-ok/);
+  assert.match(interruptStream, /"error"/);
+  assert.match(interruptStream, /\[DONE\]/);
+
   const base = `http://127.0.0.1:${routerPort}`;
   const pageResponse = await fetch(`${base}/`);
   assert.equal(pageResponse.status, 200);
@@ -1553,7 +1598,11 @@ try {
   const envBody = fs.readFileSync(envPath, 'utf8');
   assert.equal(envBody, 'BAI_API_KEY=bai-rotated-key\n');
   assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
-  assert.equal(process.env.NODE_OPTIONS, undefined);
+  // The earlier newline-injection attempt must not have written a second
+  // assignment. Assert against the env file the router actually writes, not
+  // against this test process's own environment (which the CI runner may set,
+  // e.g. NODE_OPTIONS=--max-old-space-size).
+  assert.equal(/NODE_OPTIONS/.test(envBody), false);
 
   // The new key has to apply without a restart, and the redactor has to learn
   // it so it cannot leak back out through an upstream payload.
@@ -1580,6 +1629,98 @@ try {
     afterClear.providers.find((entry) => entry.name === 'bai').configured,
     false,
   );
+
+  // Adding a provider registers it in config.json and, given a key, the env
+  // file, and it applies without a restart.
+  const addProvider = await fetch(`${base}/api/providers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin' },
+    body: JSON.stringify({
+      action: 'add',
+      name: 'groq',
+      baseUrl: 'https://api.groq.example/v1',
+      freeModels: ['llama-3.3-70b'],
+      key: 'groq-added-key',
+    }),
+  });
+  assert.equal(addProvider.status, 200);
+  const configOnDisk = JSON.parse(fs.readFileSync(testConfig, 'utf8'));
+  assert.ok(configOnDisk.providers.groq, 'provider written to config.json');
+  assert.deepEqual(configOnDisk.providers.groq.freeModels, ['llama-3.3-70b']);
+  const withGroq = await fetch(`${base}/api/state`).then((res) => res.json());
+  const groqRow = withGroq.providers.find((entry) => entry.name === 'groq');
+  assert.equal(groqRow.configured, true);
+  assert.equal(groqRow.removable, true);
+  // A bad base URL is rejected, and a duplicate name is rejected.
+  assert.equal(
+    (await fetch(`${base}/api/providers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', name: 'evil', baseUrl: 'file:///etc/passwd' }),
+    })).status,
+    400,
+  );
+  assert.equal(
+    (await fetch(`${base}/api/providers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', name: 'groq', baseUrl: 'https://x.example/v1' }),
+    })).status,
+    400,
+  );
+  // The default and discovery providers cannot be deleted from the UI.
+  assert.equal(
+    (await fetch(`${base}/api/providers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', name: 'openrouter' }),
+    })).status,
+    400,
+  );
+
+  // Reordering and deleting route entries rewrites config.routes and takes
+  // effect immediately.
+  const routeReorder = await fetch(`${base}/api/routes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      route: 'test-route',
+      entries: [
+        { provider: 'bai', model: 'glm-5.3-flash' },
+        { provider: 'gemini', model: 'gemini-3.8-flash' },
+      ],
+    }),
+  });
+  assert.equal(routeReorder.status, 200);
+  const afterRoute = JSON.parse(fs.readFileSync(testConfig, 'utf8'));
+  assert.deepEqual(
+    afterRoute.routes['test-route'].map((entry) => entry.provider + ':' + entry.model),
+    ['bai:glm-5.3-flash', 'gemini:gemini-3.8-flash'],
+  );
+  const routeState = await fetch(`${base}/api/state`).then((res) => res.json());
+  assert.deepEqual(
+    routeState.configuredRoute.map((entry) => entry.provider + ':' + entry.model),
+    ['bai:glm-5.3-flash', 'gemini:gemini-3.8-flash'],
+  );
+  // An entry naming an unknown provider is rejected.
+  assert.equal(
+    (await fetch(`${base}/api/routes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route: 'test-route', entries: [{ provider: 'ghost', model: 'x' }] }),
+    })).status,
+    400,
+  );
+
+  // Deleting a provider removes it from config and from every route.
+  const delGroq = await fetch(`${base}/api/providers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'delete', name: 'groq' }),
+  });
+  assert.equal(delGroq.status, 200);
+  const afterDelete = JSON.parse(fs.readFileSync(testConfig, 'utf8'));
+  assert.equal(afterDelete.providers.groq, undefined);
 
   console.log(
     'smoke test passed: pluggable providers, ranking, fallback, discovery, usage counters, and tracking work',

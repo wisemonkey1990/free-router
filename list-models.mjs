@@ -1,32 +1,13 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadProjectEnv } from './env.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-function loadEnvFile(file) {
-  if (!fs.existsSync(file)) return;
-  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
-    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (!match) continue;
-    let value = match[2];
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (!value || process.env[match[1]]) continue;
-    process.env[match[1]] = value;
-  }
-}
-
-for (const file of [path.join(HERE, '.env'), path.join(os.homedir(), '.hermes', '.env')]) {
-  loadEnvFile(file);
-}
+loadProjectEnv(HERE);
 
 const CONFIG_PATH = process.env.FREE_ROUTER_CONFIG || path.join(HERE, 'config.json');
 const config = fs.existsSync(CONFIG_PATH)

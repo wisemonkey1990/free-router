@@ -111,8 +111,9 @@ export function createProviderRegistry(config, { host, port }) {
   const entries = Object.entries(config.providers || {});
   if (!entries.length) throw new Error('config.providers is empty');
 
-  const providers = new Map();
-  for (const [name, raw] of entries) {
+  // Builds one provider object from its config block. Shared by the initial
+  // load and by addProvider so a runtime-added provider is identical in shape.
+  function buildProvider(name, raw) {
     if (!PROVIDER_ID.test(name)) {
       throw new Error(`invalid provider id "${name}"; use lowercase letters, digits, _ or -`);
     }
@@ -127,7 +128,7 @@ export function createProviderRegistry(config, { host, port }) {
     const catalogHasPricing = usesCatalog && cfg.pricing !== false;
     const baseUrl = String(process.env[baseUrlEnv] || cfg.baseUrl || '').replace(/\/+$/, '');
     if (!baseUrl) throw new Error(`provider ${name} is missing baseUrl`);
-    providers.set(name, {
+    return {
       name,
       keyEnv,
       baseUrlEnv,
@@ -155,7 +156,12 @@ export function createProviderRegistry(config, { host, port }) {
       catalogFetchedAt: 0,
       catalogAttemptedAt: 0,
       catalogError: '',
-    });
+    };
+  }
+
+  const providers = new Map();
+  for (const [name, raw] of entries) {
+    providers.set(name, buildProvider(name, raw));
   }
 
   const configuredDefault = config.defaultProvider;
@@ -175,6 +181,14 @@ export function createProviderRegistry(config, { host, port }) {
     configuredDiscovery ||
     [...providers.values()].find((provider) => provider.discover)?.name ||
     defaultProvider;
+
+  // Bumped whenever anything that affects which offerings exist changes: a
+  // catalog reload or an API key added/removed. offeringsForSlug rebuilds its
+  // index only when this moves, so a lookup is a Map hit instead of a scan of
+  // every provider's catalog.
+  let offeringsGeneration = 0;
+  let offeringsIndex = null;
+  let offeringsIndexGeneration = -1;
 
   function get(name) {
     return providers.get(name);
@@ -247,35 +261,45 @@ export function createProviderRegistry(config, { host, port }) {
     return { provider: providerName, model };
   }
 
-  function offeringsForSlug(slug) {
-    const normalized = String(slug || '');
-    if (!normalized) return [];
-    const offerings = [];
-    const seen = new Set();
+  // One pass over every provider, grouping the free chat offerings by model
+  // slug. Rebuilt only when offeringsGeneration moves.
+  function buildOfferingsIndex() {
+    const index = new Map();
+    const add = (slug, offering) => {
+      if (!slug) return;
+      let list = index.get(slug);
+      if (!list) index.set(slug, (list = []));
+      const key = `${offering.provider}:${offering.model}`;
+      if (list.some((entry) => `${entry.provider}:${entry.model}` === key)) return;
+      list.push(offering);
+    };
     for (const provider of providers.values()) {
       if (!provider.apiKey) continue;
       if (provider.catalogHasPricing) {
         if (!provider.catalog) continue;
         for (const model of provider.catalog.values()) {
-          if (normalizeModelSlug(model.id) !== normalized) continue;
           if (!isZeroCost(model) || !isChatModel(model)) continue;
-          const key = `${provider.name}:${model.id}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          offerings.push({ provider: provider.name, model: model.id });
+          add(normalizeModelSlug(model.id), { provider: provider.name, model: model.id });
         }
         continue;
       }
       for (const id of provider.freeModels) {
-        if (normalizeModelSlug(id) !== normalized) continue;
         if (provider.usesCatalog && provider.catalog.size && !catalogEntry(provider, id)) continue;
-        const key = `${provider.name}:${id}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        offerings.push({ provider: provider.name, model: id });
+        add(normalizeModelSlug(id), { provider: provider.name, model: id });
       }
     }
-    return offerings;
+    return index;
+  }
+
+  function offeringsForSlug(slug) {
+    const normalized = String(slug || '');
+    if (!normalized) return [];
+    if (offeringsIndexGeneration !== offeringsGeneration || !offeringsIndex) {
+      offeringsIndex = buildOfferingsIndex();
+      offeringsIndexGeneration = offeringsGeneration;
+    }
+    // Return a copy so callers cannot mutate the cached list.
+    return (offeringsIndex.get(normalized) || []).map((entry) => ({ ...entry }));
   }
 
   function directCandidates(requestedModel) {
@@ -350,6 +374,7 @@ export function createProviderRegistry(config, { host, port }) {
       }
       provider.catalogFetchedAt = Date.now();
       provider.catalogError = '';
+      offeringsGeneration += 1;
       const freeCount = provider.catalogHasPricing
         ? [...provider.catalog.values()].filter(isZeroCost).length
         : null;
@@ -478,7 +503,39 @@ export function createProviderRegistry(config, { host, port }) {
       provider.catalogAttemptedAt = 0;
       provider.catalogError = '';
     }
+    // Adding or clearing a key changes which offerings exist.
+    offeringsGeneration += 1;
     return true;
+  }
+
+  function hasProvider(name) {
+    return providers.has(name);
+  }
+
+  // Registers a provider from a config block at runtime. Throws on a bad id,
+  // a duplicate name, or a missing baseUrl, so the caller can report why.
+  function addProvider(name, raw) {
+    if (providers.has(name)) throw new Error(`provider ${name} already exists`);
+    const provider = buildProvider(name, raw);
+    providers.set(name, provider);
+    offeringsGeneration += 1;
+    return provider;
+  }
+
+  // Removes a provider at runtime. The default and discovery providers are the
+  // registry's backbone, so refuse to remove them here; that stays a config
+  // edit. Returns { ok } or { ok:false, error }.
+  function removeProvider(name) {
+    if (!providers.has(name)) return { ok: false, error: `unknown provider: ${name}` };
+    if (name === defaultProvider) {
+      return { ok: false, error: `${name} is the default provider; change defaultProvider first` };
+    }
+    if (name === discoveryProvider) {
+      return { ok: false, error: `${name} is the discovery provider; change discovery.provider first` };
+    }
+    providers.delete(name);
+    offeringsGeneration += 1;
+    return { ok: true };
   }
 
   return {
@@ -501,6 +558,9 @@ export function createProviderRegistry(config, { host, port }) {
     unavailableFreeModels,
     providerKind,
     setApiKey,
+    hasProvider,
+    addProvider,
+    removeProvider,
     chatUrl(name) {
       const provider = get(name);
       return provider ? joinUrl(provider.baseUrl, provider.chatPath) : '';

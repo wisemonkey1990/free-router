@@ -4,10 +4,16 @@
   "private": true,
   "type": "module",
   "description": "OpenAI-compatible local gateway that ranks free models across pluggable providers",
+  "license": "MIT",
+  "homepage": "https://www222fff.github.io/free-router/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/www222fff/free-router.git"
+  },
   "scripts": {
     "start": "node server.mjs",
     "models": "node list-models.mjs",
-    "check": "node --check providers.mjs && node --check proxy.mjs && node --check quota.mjs && node --check redact.mjs && node --check thought-signature.mjs && node --check server.mjs && node --check ui.mjs && node --check list-models.mjs && node --check test-smoke.mjs",
+    "check": "node --check env.mjs && node --check providers.mjs && node --check proxy.mjs && node --check quota.mjs && node --check redact.mjs && node --check thought-signature.mjs && node --check server.mjs && node --check ui.mjs && node --check list-models.mjs && node --check test-smoke.mjs",
     "test": "node test-smoke.mjs"
   },
   "engines": {

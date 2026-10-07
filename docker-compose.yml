@@ -8,10 +8,19 @@ services:
     environment:
       - FREE_ROUTER_HOST=0.0.0.0
       - FREE_ROUTER_PORT=8787
+      # Uncomment together with the `volumes` blocks below to persist discovery
+      # results and usage counters across restarts. Without this, every restart
+      # re-runs model discovery and evaluation, which spends real free-tier
+      # quota; the default keeps state ephemeral so nothing is stored on disk.
+      # - FREE_ROUTER_STATE_FILE=/data/discovered-free-models.json
     ports:
       - "127.0.0.1:8787:8787"
+    # volumes:
+    #   - free-router-state:/data
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
+# volumes:
+#   free-router-state:

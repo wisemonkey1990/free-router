@@ -27,26 +27,30 @@ if [ -s "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-load_env() {
-  local file="$1"
+# The server loads .env itself, so start.sh no longer sources these files.
+# Sourcing with `set -a` would execute any command in .env on every start; the
+# only value start.sh still needs is the port for the health-check URL, which
+# we read without evaluating the file.
+read_env_value() {
+  local name="$1" file="$2"
   [ -f "$file" ] || return 0
-  set -a
-  # shellcheck disable=SC1090
-  source "$file"
-  set +a
+  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?${name}[[:space:]]*=[[:space:]]*[\"']?([^\"'#]*).*/\2/p" "$file" \
+    | tail -n 1
 }
 
-load_env "${HOME}/.hermes/.env"
-load_env "$DIR/.env"
+PORT="${FREE_ROUTER_PORT:-}"
+[ -n "$PORT" ] || PORT="$(read_env_value FREE_ROUTER_PORT "$DIR/.env")"
+[ -n "$PORT" ] || PORT="$(read_env_value FREE_ROUTER_PORT "${HOME}/.hermes/.env")"
+PORT="${PORT:-8787}"
 
 nohup node "$DIR/server.mjs" >>"$DIR/router.log" 2>&1 &
 PID=$!
 echo "$PID" >"$PID_FILE"
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if curl -fsS "http://127.0.0.1:${FREE_ROUTER_PORT:-8787}/health" >/dev/null; then
+  if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null; then
     echo "free-router started (pid $PID, user $(id -un))"
-    echo "endpoint: http://127.0.0.1:${FREE_ROUTER_PORT:-8787}/v1"
+    echo "endpoint: http://127.0.0.1:${PORT}/v1"
     exit 0
   fi
   sleep 0.5
